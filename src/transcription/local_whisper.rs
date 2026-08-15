@@ -432,9 +432,10 @@ fn run_whisper_inference(
     // the returned state.
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
 
-    if language != "auto" {
-        params.set_language(Some(language));
-    }
+    // whisper.cpp defaults this parameter to "en", so leaving it untouched
+    // when the config says "auto" silently forces English. Pass "auto"
+    // through explicitly to enable whisper.cpp's language detection.
+    params.set_language(Some(language));
 
     // Static vocabulary/context hint (config `prompt` + `vocabulary`).
     if let Some(prompt) = prompt {
