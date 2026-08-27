@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use dialoguer::{Confirm, Input, Password, Select};
-use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, Value};
+use toml_edit::{ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
 
+use crate::config::types::{unknown_config_keys, unknown_keys_warning, PreservedKeys};
 use crate::llm::LlmConfig;
 use crate::service::{ServiceManager, OPENRC_SERVICE, SYSTEMD_UNIT};
 use crate::{
@@ -70,14 +71,34 @@ pub(crate) const WHISPER_MODEL_CHOICES: &[&str] = &[
 ];
 pub(crate) const WHISPER_MODEL_NAMES: &[&str] = &["tiny.en", "base.en", "small.en"];
 
-/// Try to load an existing config from disk.
-pub(crate) fn load_existing_config() -> Option<Config> {
-    let path = crate::config_path();
+/// Try to load an existing config from disk, together with the keys in it the
+/// schema does not know.
+///
+/// The daemon warns about those keys via `tracing`, which prints nothing in the
+/// CLI flows, so both interactive entry points get the list here and say so
+/// themselves (issue #116).
+pub(crate) fn load_existing_config() -> Option<(Config, Vec<String>)> {
+    load_existing_config_from(&crate::config_path())
+}
+
+/// Implementation of [`load_existing_config`] against an explicit path
+/// (testable).
+fn load_existing_config_from(path: &Path) -> Option<(Config, Vec<String>)> {
     if !path.exists() {
         return None;
     }
-    let contents = fs::read_to_string(&path).ok()?;
-    toml::from_str(&contents).ok()
+    let contents = fs::read_to_string(path).ok()?;
+    let config = toml::from_str(&contents).ok()?;
+    Some((config, unknown_config_keys(&contents)))
+}
+
+/// Print the unknown-key warning for a config just loaded from disk, if there
+/// is one. Called at load time by both interactive flows, so the user sees the
+/// typo before deciding what to do about it.
+pub(crate) fn print_unknown_keys_warning(unknown: &[String]) {
+    if let Some(w) = unknown_keys_warning(&crate::config_path(), unknown) {
+        println!("  {YELLOW}warning:{RESET} {w}");
+    }
 }
 
 /// Mask an API key for display, showing only the last 4 characters.
@@ -96,11 +117,14 @@ pub fn run_setup() -> Result<()> {
     println!("\n{BOLD}whisrs setup{RESET} — interactive onboarding\n");
 
     // Check for existing config.
-    if let Some(existing_cfg) = load_existing_config() {
+    if let Some((existing_cfg, unknown)) = load_existing_config() {
         println!(
             "  {GREEN}Found existing config{RESET} (backend: {BOLD}{}{RESET})",
             existing_cfg.general.backend
         );
+        // Before the prompt, not after: "Use existing" returns immediately
+        // below, so a warning printed later would never be shown at all.
+        print_unknown_keys_warning(&unknown);
         println!();
         let choice = Select::new()
             .with_prompt("What would you like to do?")
@@ -826,13 +850,28 @@ fn write_config_to(config: &Config, config_path: &Path) -> Result<()> {
                 let fresh: DocumentMut = fresh_str
                     .parse()
                     .context("failed to reparse serialized config")?;
-                merge_table(existing.as_table_mut(), fresh.as_table());
+                // Derived from the bytes on disk, on every write: a set built
+                // from `fresh_str`, or cached across writes, would describe
+                // keys that are not there and break byte-stability.
+                //
+                // "Every write" includes the daemon's LLM-command `set` path,
+                // not just the interactive flows. Measured cost of the scan:
+                // +175 us on a clean synthetic config, +2.2 ms on a real one,
+                // 148 ms on a pathological 200-unknown-section file. The
+                // confirmation pass only runs for keys the cheap reserialize
+                // diff already flagged, so a clean config pays for the diff and
+                // nothing else — fine in practice, no optimization wanted.
+                let preserved = PreservedKeys::from_config_str(&existing_str);
+                merge_table(existing.as_table_mut(), fresh.as_table(), &preserved);
                 existing.to_string()
             }
             Err(e) => {
                 // Unparseable on-disk file: there is no layout to preserve, so
                 // fall back to regenerating it from the struct (pre-#82
-                // behavior). The broken file is the only copy of the user's
+                // behavior). This branch skips the merge entirely, so unknown
+                // keys are lost here by design — the file is kept verbatim as
+                // `.bak` below, which is the recovery path for them.
+                // The broken file is the only copy of the user's
                 // hand-edits, so save it as a private backup first (it may
                 // hold API keys, hence 0600) and refuse to proceed if that
                 // backup cannot be written.
@@ -893,17 +932,33 @@ fn write_config_to(config: &Config, config_path: &Path) -> Result<()> {
 }
 
 /// Sync `existing` (the user's on-disk TOML, decor intact) to hold exactly the
-/// keys and values of `fresh` (the reserialized struct). Matching keys keep
-/// their comments and formatting, recursing into sub-tables; keys missing from
-/// `fresh` are removed; new keys are appended.
-fn merge_table(existing: &mut Table, fresh: &Table) {
-    // Drop keys the struct no longer carries. This intentionally also drops
-    // keys `Config` never knew about (it has no catch-all field), matching the
-    // previous full-rewrite behavior: the file always mirrors the struct.
+/// keys and values of `fresh` (the reserialized struct), plus whatever
+/// `preserved` marks as confirmed-unknown. Matching keys keep their comments
+/// and formatting, recursing into sub-tables; keys missing from `fresh` are
+/// removed unless preserved; new keys are appended.
+///
+/// `preserved` is the node for *this* table. Three deliberate gaps remain:
+///
+/// * A file that is valid TOML but does not deserialize gets an empty preserve
+///   set (`unknown_config_keys` reports nothing for it), so its keys are still
+///   deleted. That is issue #134, not this function's problem.
+/// * `llm_commands = [{ name = "x", bogus = 1 }]` written as an array of
+///   *inline* tables takes `merge_item`'s catch-all and is replaced wholesale,
+///   losing `bogus`. Pre-existing; the `[[llm_commands]]` spelling is handled.
+/// * A section that is *entirely* unknown but whose name is a serde alias for
+///   one the writer emits (`[asr]`, `[vibevoice]`, `[local]`) is warned about
+///   and then deleted anyway. Keeping it would put both spellings in the file
+///   and make it fail to load with `duplicate field`, so the alias loses. See
+///   [`is_preserved`].
+fn merge_table(existing: &mut Table, fresh: &Table, preserved: &PreservedKeys) {
+    // Drop keys the struct no longer carries. `Config` has no catch-all field,
+    // so this used to delete keys it never knew about as well — including the
+    // very typo the load-time warning had just told the user to fix (issue
+    // #116). Confirmed-unknown keys are exempt now; everything else still goes.
     let stale: Vec<String> = existing
         .iter()
+        .filter(|(key, item)| !fresh.contains_key(key) && !is_preserved(preserved, key, item))
         .map(|(key, _)| key.to_string())
-        .filter(|key| !fresh.contains_key(key))
         .collect();
     for key in stale {
         existing.remove(&key);
@@ -911,7 +966,7 @@ fn merge_table(existing: &mut Table, fresh: &Table) {
 
     for (key, fresh_item) in fresh.iter() {
         match existing.get_mut(key) {
-            Some(existing_item) => merge_item(existing_item, fresh_item),
+            Some(existing_item) => merge_item(existing_item, fresh_item, preserved.table(key)),
             None => {
                 // A header-less parent (e.g. `[overlay.colors]` without an
                 // explicit `[overlay]`) must gain its header once it holds a
@@ -925,17 +980,147 @@ fn merge_table(existing: &mut Table, fresh: &Table) {
     }
 }
 
-/// Merge one item of a table, dispatching on its structure.
-fn merge_item(existing: &mut Item, fresh: &Item) {
+/// Whether `key` names something the writer must keep even though `fresh` no
+/// longer carries it: a confirmed-unknown key, or a subtree made entirely of
+/// them.
+///
+/// This is the *only* place a stale key is judged, and it is reached only for
+/// keys `fresh` does not carry — which makes it the one place that can safely
+/// ask `PreservedKeys::table_prunable`, i.e. "would deleting this whole table
+/// change how the file parses?". Two rules, both learned the hard way:
+///
+/// * "Every leaf of the on-disk subtree is confirmed-unknown" is the rule, and
+///   "prefixes a confirmed-unknown path" is *not* good enough. `[local]` is a
+///   serde alias for `[local-whisper]` (likewise `[asr]`/`[vibevoice]` for
+///   `[asr-sidecar]`), so keeping a `[local]` that still holds real settings
+///   while the merge also writes the canonical `[local-whisper]` makes the file
+///   fail to deserialize with `duplicate field` — and the daemon then silently
+///   falls back to defaults, throwing away the user's entire config. Losing one
+///   stray key next to a real one is by far the lesser evil.
+/// * Even an *all*-unknown table can be an alias in disguise (`[asr] bogus = 1`
+///   prunes to an empty table that still means `[asr-sidecar]`), so a whole
+///   table is kept only when removing it provably changes nothing. Asking that
+///   question anywhere but here is what deleted typo'd keys out of `[hooks]`
+///   and `[hotkeys]`: those names *are* in `fresh`, so this function is never
+///   called for them and the merge simply recurses into them.
+fn is_preserved(preserved: &PreservedKeys, key: &str, item: &Item) -> bool {
+    if preserved.is_empty() {
+        return false;
+    }
+    match item {
+        Item::None => false,
+        Item::Value(value) => value_is_preserved(preserved, key, value),
+        Item::Table(table) => {
+            let child = preserved.table(key);
+            // `table_prunable()` is what carries the safety property here: a
+            // leafless on-disk table contributes no `PreservedKeys` node, so
+            // an empty `[asr]` is already refused by that flag before the
+            // emptiness check is consulted. `!table.is_empty()` is a cheap
+            // early-out and defence in depth, not the guard — replacing it
+            // with `true` leaves the suite green. Kept anyway: nothing should
+            // be *kept whole* when there is nothing in it to keep.
+            child.table_prunable()
+                && !table.is_empty()
+                && table
+                    .iter()
+                    .all(|(key, item)| subtree_is_preserved(child, key, item))
+        }
+        // Only an array of tables under a wholly unknown key can be stale; the
+        // schema's own (`[[llm_commands]]`) is always present in `fresh`.
+        Item::ArrayOfTables(_) => preserved.contains_leaf(key),
+    }
+}
+
+/// [`is_preserved`] for a key *inside* a subtree the caller is already keeping
+/// whole. Same rules, plus one that only makes sense there: a table with no
+/// leaves at all is preserved vacuously.
+///
+/// `t = {}`, `a = { b = {} }` and a bare `[bogus.emptysub]` header name nothing,
+/// so "every leaf of this subtree is confirmed-unknown" is trivially true of
+/// them — but they contribute no leaf, so `PreservedKeys` has no node for them
+/// and the flag-based rules read them as *not* preserved. One stray `{}`
+/// anywhere inside `[bogus]` then vetoed the whole section, and the writer
+/// deleted it: the comment, the real keys, and — because the rewritten file no
+/// longer held the keys — the warning that would have mentioned them. Issue
+/// #116's exact symptom, produced by the fix for issue #116.
+///
+/// Deliberately *not* applied at the top level, where [`is_preserved`] is
+/// reached from the stale filter. An empty `[asr]` beside any other unknown key
+/// would then be kept next to the canonical `[asr-sidecar]` the writer emits,
+/// and serde rejects that file with `duplicate field` — total config loss. Up
+/// there a leafless table must keep failing; the `table_prunable` check is the
+/// only thing standing between an aliased section and a config the daemon
+/// cannot load.
+fn subtree_is_preserved(preserved: &PreservedKeys, key: &str, item: &Item) -> bool {
+    match item {
+        Item::Value(value) => subtree_value_is_preserved(preserved, key, value),
+        Item::Table(table) if table_has_no_leaves(table) => true,
+        _ => is_preserved(preserved, key, item),
+    }
+}
+
+/// The value half of [`is_preserved`]: inline tables recurse, everything else
+/// is a leaf. A whole inline table takes the same prunability check as a header
+/// table — `asr = { bogus = 1 }` is `[asr] bogus = 1` in another spelling.
+fn value_is_preserved(preserved: &PreservedKeys, key: &str, value: &Value) -> bool {
+    match value {
+        Value::InlineTable(inline) => {
+            let child = preserved.table(key);
+            // Same division of labour as in [`is_preserved`]: the flag is the
+            // guard against `asr = {}` surviving beside `[asr-sidecar]`,
+            // `!inline.is_empty()` only the cheap early-out beside it.
+            child.table_prunable()
+                && !inline.is_empty()
+                && inline
+                    .iter()
+                    .all(|(key, value)| subtree_value_is_preserved(child, key, value))
+        }
+        _ => preserved.contains_leaf(key),
+    }
+}
+
+/// The value half of [`subtree_is_preserved`].
+fn subtree_value_is_preserved(preserved: &PreservedKeys, key: &str, value: &Value) -> bool {
+    match value {
+        Value::InlineTable(inline) if inline_has_no_leaves(inline) => true,
+        _ => value_is_preserved(preserved, key, value),
+    }
+}
+
+/// Whether `table` holds no leaf keys at all — only (possibly nested) empty
+/// tables. Mirrors `types::has_no_leaves`, over the `toml_edit` types.
+fn table_has_no_leaves(table: &Table) -> bool {
+    table.iter().all(|(_, item)| match item {
+        Item::Table(inner) => table_has_no_leaves(inner),
+        Item::Value(Value::InlineTable(inner)) => inline_has_no_leaves(inner),
+        _ => false,
+    })
+}
+
+/// [`table_has_no_leaves`] for an inline table, whose entries are all values.
+fn inline_has_no_leaves(inline: &InlineTable) -> bool {
+    inline.iter().all(|(_, value)| match value {
+        Value::InlineTable(inner) => inline_has_no_leaves(inner),
+        _ => false,
+    })
+}
+
+/// Merge one item of a table, dispatching on its structure. `preserved` is the
+/// node for this item's own subtree.
+fn merge_item(existing: &mut Item, fresh: &Item, preserved: &PreservedKeys) {
     match (existing, fresh) {
-        (Item::Table(existing), Item::Table(fresh)) => merge_table(existing, fresh),
+        (Item::Table(existing), Item::Table(fresh)) => merge_table(existing, fresh, preserved),
         (Item::ArrayOfTables(existing), Item::ArrayOfTables(fresh)) => {
-            merge_array_of_tables(existing, fresh)
+            merge_array_of_tables(existing, fresh, preserved)
         }
         // The user wrote a section as an inline table (`colors = { ... }`);
-        // the serializer always produces a header table. Keep their spelling.
-        (Item::Value(Value::InlineTable(existing)), Item::Table(fresh)) if is_flat(fresh) => {
-            merge_inline_table(existing, fresh)
+        // the serializer always produces a header table. Keep their spelling —
+        // at every depth. Bailing out to the catch-all when the fresh table was
+        // not flat is what ate `overlay = { colors = { bogos = 1 } }`: the root
+        // inline spelling of the one section with a sub-section, replaced
+        // wholesale by the fresh item, unknown keys and all.
+        (Item::Value(Value::InlineTable(existing)), Item::Table(fresh)) => {
+            merge_inline_table(existing, fresh, preserved)
         }
         (Item::Value(existing), Item::Value(fresh)) => merge_value(existing, fresh),
         // Structural change (e.g. `llm_commands = []` becoming a populated
@@ -982,8 +1167,13 @@ fn values_equal(a: &Value, b: &Value) -> bool {
 /// matched to their on-disk counterpart by `name` first (so deleting or
 /// reordering entries keeps each survivor's comments), falling back to
 /// position for tables without a usable `name`. Fresh entries with no match
-/// are appended; on-disk entries with no match are dropped.
-fn merge_array_of_tables(existing: &mut ArrayOfTables, fresh: &ArrayOfTables) {
+/// are appended; on-disk entries with no match are dropped — whole, unknown
+/// keys included, because the user deleted them.
+fn merge_array_of_tables(
+    existing: &mut ArrayOfTables,
+    fresh: &ArrayOfTables,
+    preserved: &PreservedKeys,
+) {
     let mut consumed = vec![false; existing.len()];
     let mut merged: Vec<Table> = Vec::with_capacity(fresh.len());
 
@@ -998,7 +1188,12 @@ fn merge_array_of_tables(existing: &mut ArrayOfTables, fresh: &ArrayOfTables) {
         match matched.and_then(|i| existing.get(i).cloned().map(|t| (i, t))) {
             Some((i, mut table)) => {
                 consumed[i] = true;
-                merge_table(&mut table, fresh_table);
+                // `i`, never `fresh_idx`: `Seg::Index` is the position in the
+                // on-disk document, and deleting an earlier entry shifts every
+                // later one. Indexing with the fresh position would apply a
+                // deleted entry's unknown keys to its successor and delete the
+                // successor's own.
+                merge_table(&mut table, fresh_table, preserved.element(i));
                 merged.push(table);
             }
             None => merged.push(fresh_table.clone()),
@@ -1016,31 +1211,47 @@ fn entry_name(table: &Table) -> Option<&str> {
     table.get("name").and_then(Item::as_str)
 }
 
-/// True when every entry of `table` is a plain value (no sub-tables).
-fn is_flat(table: &Table) -> bool {
-    table.iter().all(|(_, item)| item.is_value())
-}
-
-/// Sync a user-written inline table against the flat header table the
-/// serializer produced for the same section.
-fn merge_inline_table(existing: &mut toml_edit::InlineTable, fresh: &Table) {
+/// Sync a user-written inline table against the header table the serializer
+/// produced for the same section.
+///
+/// Carries its own copy of `merge_table`'s stale filter, so it needs its own
+/// copy of the preserve exemption too: `colors = { theme = "x", bogos = 1 }`
+/// reaches this path and nothing else.
+///
+/// A sub-section of `fresh` (`[overlay.colors]` under a root-level
+/// `overlay = { ... }`) has to be re-spelled inline to go inside an inline
+/// table. Where the user already wrote one, recurse into it so its unknown keys
+/// take the same exemption; otherwise `Item::into_value` does the conversion
+/// (`Table` -> `InlineTable`, `ArrayOfTables` -> array of inline tables) and
+/// normalizes the decor, so the header-table blank lines do not leak into a
+/// value position.
+fn merge_inline_table(existing: &mut InlineTable, fresh: &Table, preserved: &PreservedKeys) {
     let stale: Vec<String> = existing
         .iter()
+        .filter(|(key, value)| {
+            !fresh.contains_key(key) && !value_is_preserved(preserved, key, value)
+        })
         .map(|(key, _)| key.to_string())
-        .filter(|key| !fresh.contains_key(key))
         .collect();
     for key in stale {
         existing.remove(&key);
     }
     for (key, fresh_item) in fresh.iter() {
-        // `is_flat` guarantees every fresh item is a value.
-        let Some(fresh_value) = fresh_item.as_value() else {
+        if let (Some(Value::InlineTable(nested)), Item::Table(fresh_table)) =
+            (existing.get_mut(key), fresh_item)
+        {
+            merge_inline_table(nested, fresh_table, preserved.table(key));
+            continue;
+        }
+        // `Item::None` is the only shape with no value form, and a serialized
+        // `Config` never produces one.
+        let Ok(fresh_value) = fresh_item.clone().into_value() else {
             continue;
         };
         match existing.get_mut(key) {
-            Some(existing_value) => merge_value(existing_value, fresh_value),
+            Some(existing_value) => merge_value(existing_value, &fresh_value),
             None => {
-                existing.insert(key, fresh_value.clone());
+                existing.insert(key, fresh_value);
             }
         }
     }
@@ -2421,6 +2632,716 @@ instruction = "Polish the text."
         assert_eq!(
             first, second,
             "second write of an identical Config must be byte-identical"
+        );
+    }
+
+    /// A config carrying keys the schema does not know, in every shape the
+    /// merge has to handle: a typo'd key with a trailing comment, a stray key
+    /// beside a real one, a whole unknown section with a nested sub-section,
+    /// and a stray key inside the *second* `[[llm_commands]]` entry.
+    const CONFIG_WITH_UNKNOWN_KEYS: &str = r#"[general]
+backend = "groq"
+
+[input]
+past = true # typo for `paste` - do not eat my comment
+
+[deepgram]
+api_key = "k"
+bogus = 2
+
+[bogus]
+foo = 1
+
+[bogus.nested]
+bar = 2
+
+[[llm_commands]]
+name = "german"
+hotkey = "Super+Shift+G"
+instruction = "Translate to German."
+
+[[llm_commands]]
+name = "polish"
+hotkey = "Super+Shift+P"
+instruction = "Polish the text."
+stray = "keep me"
+"#;
+
+    fn write_unknown_key_fixture(dir: &tempfile::TempDir) -> PathBuf {
+        let path = dir.path().join("config.toml");
+        fs::write(&path, CONFIG_WITH_UNKNOWN_KEYS).expect("write fixture");
+        path
+    }
+
+    /// Write `contents` to a fresh temp config and round-trip it through
+    /// `write_config_to`, returning the rewritten file.
+    fn rewrite(dir: &tempfile::TempDir, contents: &str) -> String {
+        let path = dir.path().join("config.toml");
+        fs::write(&path, contents).expect("write fixture");
+        write_config_to(&parse_config(contents), &path).unwrap();
+        fs::read_to_string(&path).unwrap()
+    }
+
+    /// [`rewrite`] plus the two invariants that outrank whatever the caller is
+    /// actually asserting: the rewritten file still deserializes into `Config`
+    /// (a file that stops loading is total config loss, strictly worse than the
+    /// key-eating bug), and writing it again does not perturb a byte (a
+    /// preserved key that moves or re-renders churns the file on every save).
+    fn rewrite_checked(dir: &tempfile::TempDir, contents: &str) -> String {
+        let out = rewrite(dir, contents);
+        toml::from_str::<Config>(&out)
+            .unwrap_or_else(|e| panic!("rewrite no longer deserializes: {e}\n{out}"));
+        let path = dir.path().join("config.toml");
+        write_config_to(&parse_config(&out), &path).unwrap();
+        assert_eq!(
+            out,
+            fs::read_to_string(&path).unwrap(),
+            "the second write is not byte-identical"
+        );
+        out
+    }
+
+    #[test]
+    fn unknown_keys_and_their_comments_survive_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_unknown_key_fixture(&dir);
+
+        write_config_to(&parse_config(CONFIG_WITH_UNKNOWN_KEYS), &path).unwrap();
+
+        let out = fs::read_to_string(&path).unwrap();
+        // The typo the load-time warning points at, comment included.
+        assert!(
+            out.contains("past = true # typo for `paste` - do not eat my comment"),
+            "{out}"
+        );
+        // A stray key beside a real one in a known section.
+        assert!(out.contains("bogus = 2"), "{out}");
+        // A whole unknown section, nested sub-section included.
+        assert!(out.contains("[bogus]"), "{out}");
+        assert!(out.contains("foo = 1"), "{out}");
+        assert!(out.contains("[bogus.nested]"), "{out}");
+        assert!(out.contains("bar = 2"), "{out}");
+        // And one inside an array-of-tables entry.
+        assert!(out.contains(r#"stray = "keep me""#), "{out}");
+
+        // The known keys still merged normally and the file still loads.
+        let reparsed: Config = toml::from_str(&out).unwrap();
+        assert_eq!(reparsed.deepgram.unwrap().api_key, "k");
+        assert!(!reparsed.input.paste);
+        // Still reported, so the warning keeps naming them.
+        assert!(unknown_config_keys(&out).contains(&"input.past".to_string()));
+    }
+
+    #[test]
+    fn rewriting_a_config_with_unknown_keys_is_byte_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_unknown_key_fixture(&dir);
+
+        let config = parse_config(CONFIG_WITH_UNKNOWN_KEYS);
+        write_config_to(&config, &path).unwrap();
+        let first = fs::read_to_string(&path).unwrap();
+        write_config_to(&config, &path).unwrap();
+        let second = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            first, second,
+            "a preserved key must not move, duplicate, or re-render on the next write"
+        );
+    }
+
+    #[test]
+    fn a_hotkey_alias_is_recanonicalized_while_the_typo_beside_it_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = rewrite(
+            &dir,
+            "[general]\nbackend = \"groq\"\n\n[hotkeys]\nread = \"Super+Shift+R\"\nbogus = \"Super+X\"\n",
+        );
+
+        // `read` is a serde alias for `speak`, so it is *known*, never
+        // preserved, and replaced by the canonical spelling exactly once —
+        // keeping both would be a `duplicate field` error on the next load.
+        assert!(!out.contains("read ="), "alias key survived: {out}");
+        assert_eq!(out.matches("speak = ").count(), 1, "{out}");
+        assert!(out.contains(r#"bogus = "Super+X""#), "{out}");
+        let reparsed: Config = toml::from_str(&out).unwrap();
+        assert_eq!(
+            reparsed.hotkeys.unwrap().speak.as_deref(),
+            Some("Super+Shift+R")
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_survives_the_deletion_of_an_earlier_llm_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_unknown_key_fixture(&dir);
+
+        // `stray` lives in on-disk entry 1; deleting entry 0 makes `polish`
+        // *fresh* entry 0. Descending with the fresh index would delete
+        // `stray` and try to apply the removed entry's keys to `polish`.
+        let mut config = parse_config(CONFIG_WITH_UNKNOWN_KEYS);
+        config.llm_commands.retain(|c| c.name != "german");
+        write_config_to(&config, &path).unwrap();
+
+        let out = fs::read_to_string(&path).unwrap();
+        assert!(!out.contains(r#"name = "german""#), "{out}");
+        assert!(out.contains(r#"name = "polish""#), "{out}");
+        assert!(out.contains(r#"stray = "keep me""#), "{out}");
+        let reparsed: Config = toml::from_str(&out).unwrap();
+        assert_eq!(reparsed.llm_commands.len(), 1);
+    }
+
+    #[test]
+    fn an_unknown_key_in_an_inline_table_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = rewrite(
+            &dir,
+            "[general]\nbackend = \"groq\"\n\n[overlay]\ntheme = \"custom\"\n\
+             colors = { background = \"#000000\", bogos = 1 }\n",
+        );
+
+        // `merge_inline_table` carries its own stale filter, so it needs its
+        // own copy of the exemption: the user's inline spelling survives, and
+        // so does the stray key inside it.
+        assert!(out.contains("colors = {"), "{out}");
+        assert!(out.contains("bogos = 1"), "{out}");
+        assert!(out.contains(r##"background = "#000000""##), "{out}");
+        let _: Config = toml::from_str(&out).unwrap();
+    }
+
+    #[test]
+    fn a_mixed_alias_section_is_still_dropped_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = rewrite(
+            &dir,
+            "[general]\nbackend = \"local\"\n\n[local]\nmodel_path = \"/m.bin\"\nbogus = 1\n",
+        );
+
+        // `model_path` is a real setting reached through the `local` ->
+        // `local-whisper` alias, so the subtree is mixed and goes wholesale.
+        // Keeping `[local]` beside the canonical section would make the file
+        // fail to deserialize with `duplicate field`, i.e. the daemon would
+        // discard the user's entire config.
+        assert!(!out.contains("bogus = 1"), "{out}");
+        assert!(!out.contains("[local]"), "{out}");
+        assert!(out.contains("[local-whisper]"), "{out}");
+        let reparsed: Config = toml::from_str(&out).unwrap();
+        assert_eq!(reparsed.local_whisper.unwrap().model_path, "/m.bin");
+    }
+
+    #[test]
+    fn a_wholly_unknown_alias_section_is_dropped_rather_than_duplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = rewrite(&dir, "[general]\nbackend = \"groq\"\n\n[asr]\nbogus = 1\n");
+
+        // Every leaf of `[asr]` is confirmed-unknown, but `asr` is a serde
+        // alias for the `asr-sidecar` section the writer emits. The file
+        // still loading is the whole point of the check.
+        assert!(!out.contains("bogus = 1"), "{out}");
+        let reparsed: Config = toml::from_str(&out).unwrap();
+        assert!(reparsed.asr_sidecar.is_some());
+    }
+
+    /// The class of config every other fixture here misses: a section the
+    /// schema *knows*, whose fields are all optional, holding nothing but
+    /// typos. `[hotkeys] speek = "Super+R"` is the likeliest real-world shape
+    /// of issue #116 and the one the first cut of the fix still ate — the
+    /// section parses to `Some(default)`, deleting it would parse to `None`,
+    /// and the whole-table guard read that as "not ignorable" and pruned the
+    /// node, taking the keys and their comments with it. Worse, the rewritten
+    /// file then reported *nothing* unknown, so even the warning stopped.
+    #[test]
+    fn a_typo_that_is_a_sections_only_key_survives_with_its_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = rewrite(
+            &dir,
+            "[general]\nbackend = \"groq\"\n\n\
+             # pause music while I dictate\n\
+             [hooks]\nmedia_autopause = true      # typo for media_auto_pause\n\n\
+             # my hotkeys\n[hotkeys]\nbogus = \"Super+X\"\nspeek = \"Super+R\" # meant `speak`\n\n\
+             [input]\npast = true\n\n\
+             [llm]\nbogus = 1\n\n[tts]\nbogus = 2\n",
+        );
+
+        assert!(
+            out.contains("media_autopause = true      # typo for media_auto_pause"),
+            "{out}"
+        );
+        assert!(out.contains("# pause music while I dictate"), "{out}");
+        assert!(
+            out.contains(r#"speek = "Super+R" # meant `speak`"#),
+            "{out}"
+        );
+        assert!(out.contains("# my hotkeys"), "{out}");
+        assert!(out.contains(r#"bogus = "Super+X""#), "{out}");
+        assert!(out.contains("past = true"), "{out}");
+        assert!(out.contains("bogus = 1"), "{out}");
+        assert!(out.contains("bogus = 2"), "{out}");
+
+        // The file must still load, and the warning must keep naming the keys:
+        // losing them silently also lost the only prompt to fix them.
+        let _: Config = toml::from_str(&out).unwrap();
+        assert_eq!(
+            unknown_config_keys(&out),
+            vec![
+                "hooks.media_autopause",
+                "hotkeys.bogus",
+                "hotkeys.speek",
+                "input.past",
+                "llm.bogus",
+                "tts.bogus"
+            ],
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_typo_in_a_nested_all_optional_section_survives() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // As a standard table.
+        let out = rewrite(
+            &dir,
+            "[general]\nbackend = \"groq\"\n\n[overlay.colors]\nbogos = 1\n",
+        );
+        assert!(out.contains("bogos = 1"), "{out}");
+        let _: Config = toml::from_str(&out).unwrap();
+
+        // And as an inline table whose *every* key is unknown (`theme` is a
+        // field of `[overlay]`, not of `colors`), which is what makes the
+        // whole-table question apply one level down.
+        let out = rewrite(
+            &dir,
+            "[general]\nbackend = \"groq\"\n\n[overlay]\ncolors = { theme = \"dark\", bogos = 1 }\n",
+        );
+        assert!(out.contains(r#"theme = "dark""#), "{out}");
+        assert!(out.contains("bogos = 1"), "{out}");
+        let _: Config = toml::from_str(&out).unwrap();
+    }
+
+    #[test]
+    fn a_wholly_unknown_array_of_tables_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = rewrite(
+            &dir,
+            "[general]\nbackend = \"groq\"\n\n[[bogus]]\nfoo = 1\n\n[[bogus]]\nfoo = 2\n",
+        );
+
+        // The array takes `is_preserved`'s `ArrayOfTables` arm, where the
+        // confirmed-unknown *leaf* `bogus` carries the whole thing.
+        assert_eq!(out.matches("[[bogus]]").count(), 2, "{out}");
+        assert!(out.contains("foo = 1") && out.contains("foo = 2"), "{out}");
+        let _: Config = toml::from_str(&out).unwrap();
+    }
+
+    #[test]
+    fn a_wholly_unknown_alias_section_is_dropped_in_every_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // `[vibevoice]` aliases `[asr-sidecar]` exactly as `[asr]` does.
+        let out = rewrite(
+            &dir,
+            "[general]\nbackend = \"groq\"\n\n[vibevoice]\nbogus = 1\n",
+        );
+        assert!(!out.contains("bogus = 1"), "{out}");
+        assert!(!out.contains("[vibevoice]"), "{out}");
+        let reparsed: Config = toml::from_str(&out).unwrap();
+        assert!(reparsed.asr_sidecar.is_some());
+
+        // Same section written as a root inline table, which reaches the
+        // exemption through `value_is_preserved` instead of `is_preserved`.
+        let out = rewrite(
+            &dir,
+            "asr = { bogus = 1 }\n\n[general]\nbackend = \"groq\"\n",
+        );
+        assert!(!out.contains("bogus = 1"), "{out}");
+        assert!(!out.contains("asr = {"), "{out}");
+        let reparsed: Config = toml::from_str(&out).unwrap();
+        assert!(reparsed.asr_sidecar.is_some());
+    }
+
+    /// The whole preserve rule as one table, driven through the real writer.
+    ///
+    /// The invariant that outranks every row: the rewritten file still
+    /// deserializes into `Config`. A file that stops loading is total config
+    /// loss — strictly worse than the key-eating bug this all exists to fix —
+    /// so it is asserted for every row, including the ones that drop keys.
+    #[test]
+    fn the_preserve_matrix_holds_and_every_rewrite_still_loads() {
+        struct Row {
+            what: &'static str,
+            contents: &'static str,
+            /// Substrings the rewritten file must still contain.
+            kept: &'static [&'static str],
+            /// Substrings it must not contain.
+            gone: &'static [&'static str],
+            /// Substrings it must contain exactly once (no alias duplication).
+            once: &'static [&'static str],
+        }
+
+        const GENERAL: &str = "[general]\nbackend = \"groq\"\n\n";
+        let rows = [
+            Row {
+                what: "a typo that is a known section's only key",
+                contents: "[hotkeys]\nspeek = \"Super+R\" # meant `speak`\n",
+                kept: &["speek = \"Super+R\" # meant `speak`"],
+                gone: &[],
+                once: &[],
+            },
+            Row {
+                what: "a typo in [hooks]",
+                contents: "[hooks]\nmedia_autopause = true\n",
+                kept: &["media_autopause = true"],
+                gone: &[],
+                once: &[],
+            },
+            Row {
+                what: "an all-unknown inline sub-table",
+                contents: "[overlay]\ncolors = { theme = \"dark\", bogos = 1 }\n",
+                kept: &["theme = \"dark\"", "bogos = 1"],
+                gone: &[],
+                once: &[],
+            },
+            Row {
+                what: "a typo in a nested standard table",
+                contents: "[overlay.colors]\nbogos = 1\n",
+                kept: &["bogos = 1"],
+                gone: &[],
+                once: &[],
+            },
+            Row {
+                what: "typos in [llm] and [tts]",
+                contents: "[llm]\nbogus = 1\n\n[tts]\nbogus = 2\n",
+                kept: &["bogus = 1", "bogus = 2"],
+                gone: &[],
+                once: &[],
+            },
+            Row {
+                what: "a wholly unknown alias section",
+                contents: "[asr]\nbogus = 1\n",
+                kept: &["[asr-sidecar]"],
+                gone: &["bogus = 1", "[asr]\n"],
+                once: &["[asr-sidecar]"],
+            },
+            Row {
+                what: "the other alias for the same section",
+                contents: "[vibevoice]\nbogus = 1\n",
+                kept: &["[asr-sidecar]"],
+                gone: &["bogus = 1", "[vibevoice]"],
+                once: &["[asr-sidecar]"],
+            },
+            Row {
+                what: "a mixed alias section",
+                contents: "[local]\nmodel_path = \"/m.bin\"\nbogus = 1\n",
+                kept: &["[local-whisper]", "/m.bin"],
+                gone: &["bogus = 1", "[local]\n"],
+                once: &["model_path"],
+            },
+            Row {
+                what: "an unknown sub-table inside a known section",
+                contents: "[hooks]\nmedia_auto_pause = true\n\n[hooks.bogus]\nx = 1\n",
+                kept: &["[hooks.bogus]", "x = 1", "media_auto_pause = true"],
+                gone: &[],
+                once: &["[hooks.bogus]"],
+            },
+            Row {
+                what: "a wholly unknown section with a nested one",
+                contents: "[bogus]\nfoo = 1\n\n[bogus.nested]\nbar = 2\n",
+                kept: &["[bogus]", "foo = 1", "[bogus.nested]", "bar = 2"],
+                gone: &[],
+                once: &[],
+            },
+            Row {
+                what: "a typo beside real keys",
+                contents: "[input]\npast = true\n",
+                kept: &["past = true"],
+                gone: &[],
+                once: &["paste = "],
+            },
+            Row {
+                what: "a hotkey alias",
+                contents: "[hotkeys]\nread = \"Super+R\"\n",
+                kept: &["speak = \"Super+R\""],
+                gone: &["read = "],
+                once: &["speak = "],
+            },
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        for row in rows {
+            let out = rewrite(&dir, &format!("{GENERAL}{}", row.contents));
+            for needle in row.kept {
+                assert!(out.contains(needle), "{}: lost `{needle}`\n{out}", row.what);
+            }
+            for needle in row.gone {
+                assert!(
+                    !out.contains(needle),
+                    "{}: kept `{needle}`\n{out}",
+                    row.what
+                );
+            }
+            for needle in row.once {
+                assert_eq!(
+                    out.matches(needle).count(),
+                    1,
+                    "{}: `{needle}` is not written exactly once\n{out}",
+                    row.what
+                );
+            }
+            toml::from_str::<Config>(&out)
+                .unwrap_or_else(|e| panic!("{}: rewrite no longer loads: {e}\n{out}", row.what));
+
+            // And the write after that (a `set_hotkey` press, say) must not
+            // perturb a byte: a preserved key that moves or re-renders would
+            // churn the file on every save.
+            let path = dir.path().join("config.toml");
+            write_config_to(&parse_config(&out), &path).unwrap();
+            assert_eq!(
+                out,
+                fs::read_to_string(&path).unwrap(),
+                "{}: the second write is not byte-stable",
+                row.what
+            );
+        }
+    }
+
+    /// One `{}` inside an unknown section used to delete the whole section.
+    ///
+    /// An empty table contributes no leaf, so `PreservedKeys` has no node for
+    /// it, `covers` read the missing node as "not confirmed-unknown", and the
+    /// writer dropped `[bogus]` entire — the comment above it and both real
+    /// keys with it. And because the rewritten file no longer held those keys,
+    /// `unknown_config_keys` went quiet too: the tool warned about the data
+    /// once, ate it, and then stopped mentioning it. That is issue #116's exact
+    /// symptom, shipped by the fix for issue #116, and the write is byte-stable
+    /// afterwards so nothing ever notices.
+    #[test]
+    fn a_stray_empty_table_does_not_delete_the_section_around_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = rewrite_checked(
+            &dir,
+            "[general]\nbackend = \"groq\"\n\n\
+             # my notes about this section\n\
+             [bogus]\nimportant = \"please keep me\"      # user data\n\
+             other = 42\nempty_table = {}\n",
+        );
+
+        assert!(out.contains("# my notes about this section"), "{out}");
+        assert!(
+            out.contains("important = \"please keep me\"      # user data"),
+            "{out}"
+        );
+        assert!(out.contains("other = 42"), "{out}");
+        // The warning has to keep firing: losing the keys also lost the only
+        // prompt to fix them.
+        assert_eq!(
+            unknown_config_keys(&out),
+            vec!["bogus.important", "bogus.other"],
+            "{out}"
+        );
+    }
+
+    /// Every spelling of "a table with no leaves in it", and the blast radius
+    /// each one used to have. All of these lost data before the vacuous rule in
+    /// `subtree_is_preserved`.
+    #[test]
+    fn a_leafless_table_never_vetoes_its_enclosing_subtree() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // A bare sub-table header with no keys under it.
+        let out = rewrite_checked(
+            &dir,
+            "[general]\nbackend = \"groq\"\n\n[bogus]\nimportant = \"keep\"\n\n[bogus.emptysub]\n",
+        );
+        assert!(out.contains(r#"important = "keep""#), "{out}");
+        assert!(out.contains("[bogus.emptysub]"), "{out}");
+
+        // An empty table nested inside an inline one, two levels down.
+        let out = rewrite_checked(
+            &dir,
+            "[general]\nbackend = \"groq\"\n\n[bogus]\nimportant = \"keep\"\na = { b = {} }\n",
+        );
+        assert!(out.contains(r#"important = "keep""#), "{out}");
+        assert!(out.contains("a = { b = {} }"), "{out}");
+
+        // An unknown subtree of a *known* section — `[tts]` and `[overlay]` are
+        // in `fresh`, so the merge recurses into them and the stale filter sees
+        // the sub-table on its own.
+        for section in ["tts", "overlay"] {
+            let out = rewrite_checked(
+                &dir,
+                &format!(
+                    "[general]\nbackend = \"groq\"\n\n[{section}.bogus]\nkeep_me = 1\nt = {{}}\n"
+                ),
+            );
+            assert!(out.contains("keep_me = 1"), "{section}: {out}");
+            assert_eq!(
+                unknown_config_keys(&out),
+                vec![format!("{section}.bogus.keep_me")],
+                "{section}: {out}"
+            );
+        }
+
+        // Blast radius: the top-most unknown table went, its siblings did not.
+        let out = rewrite_checked(
+            &dir,
+            "[general]\nbackend = \"groq\"\n\n[wipeme]\nx = 1\nt = {}\n\n[keepme]\ny = 2\n",
+        );
+        assert!(out.contains("[wipeme]") && out.contains("x = 1"), "{out}");
+        assert!(out.contains("[keepme]") && out.contains("y = 2"), "{out}");
+    }
+
+    /// The other side of the vacuous rule: it is deliberately not applied by
+    /// the top-level stale filter, so an empty table that is a *direct* key of
+    /// a known section still goes. Keeping it there would mean keeping an empty
+    /// `[asr]` too, beside the canonical `[asr-sidecar]` the writer emits, and
+    /// serde rejects that file with `duplicate field`.
+    #[test]
+    fn an_empty_table_beside_a_known_sections_keys_is_still_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = rewrite_checked(
+            &dir,
+            "[general]\nbackend = \"groq\"\n\n[overlay]\nbogus_tbl = {}\nother_bogus = 3\n",
+        );
+
+        assert!(!out.contains("bogus_tbl"), "{out}");
+        assert!(out.contains("other_bogus = 3"), "{out}");
+    }
+
+    /// The vacuous rule must not weaken the alias guard, which is a separate
+    /// condition (`table_prunable`, not `covers`). An empty sub-table now lets
+    /// `[asr]` *cover* itself, so the whole-table question is asked where it
+    /// previously was not — and the answer still has to be "no".
+    #[test]
+    fn an_alias_section_with_an_empty_subtable_is_still_dropped_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = rewrite_checked(
+            &dir,
+            "[general]\nbackend = \"groq\"\n\n[asr]\nbogus = 1\n\n[asr.empty]\n",
+        );
+
+        assert!(!out.contains("bogus = 1"), "{out}");
+        assert!(!out.contains("[asr]"), "{out}");
+        assert!(!out.contains("[asr.empty]"), "{out}");
+        assert_eq!(out.matches("[asr-sidecar]").count(), 1, "{out}");
+        let reparsed: Config = toml::from_str(&out).unwrap();
+        assert!(reparsed.asr_sidecar.is_some());
+
+        // The shape that decides where the vacuous rule may be applied: an
+        // aliased section that is *itself* leafless, beside an unknown key
+        // elsewhere so the preserve set is non-empty and the stale filter
+        // actually runs. Treating leafless tables as preserved at the top level
+        // would keep this one next to the `[asr-sidecar]` the writer emits, and
+        // serde rejects that with `duplicate field` — the daemon then falls
+        // back to defaults and the user's whole config is gone.
+        for contents in [
+            // As a header, as a bare sub-table header, and as a root inline
+            // table (which has to come before any section header to stay at the
+            // root rather than becoming a key of `[general]`).
+            "[general]\nbackend = \"groq\"\n\n[asr]\n\n[bogus]\nx = 1\n",
+            "[general]\nbackend = \"groq\"\n\n[asr.empty]\n\n[bogus]\nx = 1\n",
+            "asr = {}\n\n[general]\nbackend = \"groq\"\n\n[bogus]\nx = 1\n",
+        ] {
+            let spelling = contents;
+            let out = rewrite_checked(&dir, contents);
+            assert!(!out.contains("asr ="), "{spelling}: {out}");
+            assert!(!out.contains("[asr]"), "{spelling}: {out}");
+            assert!(!out.contains("[asr.empty]"), "{spelling}: {out}");
+            assert_eq!(out.matches("[asr-sidecar]").count(), 1, "{spelling}: {out}");
+            // The unrelated unknown section is untouched, so the drop above is
+            // the alias guard doing its job, not the preserve set being empty.
+            assert!(out.contains("[bogus]") && out.contains("x = 1"), "{out}");
+        }
+    }
+
+    /// `overlay` is the only section with a sub-section, so it is the only one
+    /// whose *root inline* spelling made `merge_item` bail to the catch-all —
+    /// the fresh table is not flat — and replace the user's whole table with
+    /// the fresh one, unknown keys and all. Every other section round-tripped
+    /// this shape fine, which is why it took a nested fixture to find.
+    #[test]
+    fn a_root_inline_section_with_a_nested_inline_table_keeps_its_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let out = rewrite_checked(
+            &dir,
+            "overlay = { theme = \"dark\", colors = { ring = \"#fff\", bogos = 1 } }\n\n\
+             [general]\nbackend = \"groq\"\n",
+        );
+        assert!(out.contains("bogos = 1"), "{out}");
+        assert!(out.contains(r##"ring = "#fff""##), "{out}");
+        assert_eq!(
+            unknown_config_keys(&out),
+            vec!["overlay.colors.bogos"],
+            "{out}"
+        );
+        // The user's inline spelling survives, so no header is synthesized —
+        // which also disposes of the `[overlay ]` the conversion used to emit,
+        // key decor and all.
+        assert!(!out.contains("[overlay"), "{out}");
+
+        // An unknown scalar in the outer inline table alongside the nested one.
+        let out = rewrite_checked(
+            &dir,
+            "overlay = { theme = \"dark\", ov_bogus = 2, colors = { bogos = 3 } }\n\n\
+             [general]\nbackend = \"groq\"\n",
+        );
+        assert!(out.contains("ov_bogus = 2"), "{out}");
+        assert!(out.contains("bogos = 3"), "{out}");
+        assert_eq!(
+            unknown_config_keys(&out),
+            vec!["overlay.colors.bogos", "overlay.ov_bogus"],
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn load_existing_config_from_reports_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_unknown_key_fixture(&dir);
+
+        let (config, unknown) = load_existing_config_from(&path).expect("fixture loads");
+        assert_eq!(config.general.backend, "groq");
+        assert_eq!(
+            unknown,
+            vec![
+                "bogus.foo",
+                "bogus.nested.bar",
+                "deepgram.bogus",
+                "input.past",
+                "llm_commands[1].stray",
+            ]
+        );
+
+        assert!(load_existing_config_from(&dir.path().join("absent.toml")).is_none());
+    }
+
+    /// The text of the function `source` declares at `header`, up to the next
+    /// top-level item.
+    fn function_body<'a>(source: &'a str, header: &str) -> &'a str {
+        source
+            .split(header)
+            .nth(1)
+            .unwrap_or_else(|| panic!("source does not define `{header}`"))
+            .split("\n}\n")
+            .next()
+            .expect("function has a body")
+    }
+
+    /// `run_setup` is pure dialoguer IO and cannot be unit tested, so pin the
+    /// one line that matters the way `edit.rs` pins its hotkey prompts
+    /// (`edit_hotkeys_prompts_for_every_field`). Issue #116 was exactly this
+    /// call being absent.
+    #[test]
+    fn run_setup_warns_about_unknown_keys_before_prompting() {
+        let body = function_body(include_str!("setup.rs"), "pub fn run_setup(");
+        let warn_at = body
+            .find("print_unknown_keys_warning(&unknown)")
+            .expect("run_setup never warns about unknown keys");
+        // Before the prompt: the "Use existing" branch returns straight after
+        // it, so a warning printed later would never be seen at all.
+        let prompt_at = body.find("Select::new()").expect("run_setup prompts");
+        assert!(
+            warn_at < prompt_at,
+            "the warning must be printed before the use-existing prompt"
         );
     }
 }
