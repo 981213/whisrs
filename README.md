@@ -82,8 +82,10 @@ whisrs setup
 ### Arch Linux (AUR)
 
 ```bash
-yay -S whisrs-git
+yay -S whisrs-bin    # prebuilt release binaries, tracks tagged versions
 ```
+
+`whisrs-bin` installs the same tarball as the Quick install above, so upgrades follow releases and there is no Rust toolchain or whisper.cpp build. To build from source and follow `main` instead, use `yay -S whisrs-git` — it rebuilds on every upstream commit and needs `cargo`, `clang` and `cmake`.
 
 After install, run `whisrs setup` to configure your backend, API keys, permissions, and keybindings.
 
