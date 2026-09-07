@@ -252,12 +252,15 @@ When a feature or set of changes warrants a version bump:
 4. **Commit** and **push**
 5. **Tag and release on GitHub**: `git tag v<VERSION>; git push origin v<VERSION>`, then create a GitHub release with `gh release create v<VERSION>` including release notes summarizing the changes
 6. **Publish to crates.io**: Always run `cargo publish` after pushing a version bump — do not skip this step
-7. **Update the AUR package** in its own repo (not this one): bump `pkgver` in the `PKGBUILD`, regenerate `.SRCINFO` with `makepkg --printsrcinfo > .SRCINFO`, commit, and push to AUR
+7. **Update both AUR packages** in their own repos (not this one): bump `pkgver` in the `PKGBUILD`, regenerate `.SRCINFO` with `makepkg --printsrcinfo > .SRCINFO`, commit, and push to AUR.
+   `whisrs-bin` also needs both `sha256sums_x86_64` and `sha256sums_aarch64` refreshed against the new release tarballs — do it **after** step 5, since the assets do not exist until the release workflow finishes
 
 ## Packaging
 
 Packaging files (AUR PKGBUILD, etc.) do NOT belong in this repo. They are maintained externally:
-- **AUR**: `whisrs-git` package on AUR (maintained locally, pushed via `makepkg --printsrcinfo > .SRCINFO; git push`)
+- **AUR**: two packages, both maintained locally and pushed via `makepkg --printsrcinfo > .SRCINFO; git push`
+  - `whisrs-bin` (`~/Projects/whisrs-bin/`) — prebuilt release tarballs, pinned to a tag. The recommended install
+  - `whisrs-git` (`~/Projects/whisrs-git/`) — builds from `main` HEAD, no tag pin
 - **Nix**: `flake.nix` lives in-repo (standard practice for Nix projects)
 - **crates.io**: `cargo publish` manually after version bump
 
