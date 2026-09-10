@@ -830,7 +830,11 @@ pub fn write_config(config: &Config) -> Result<PathBuf> {
 }
 
 /// Implementation of [`write_config`] against an explicit path (testable).
-fn write_config_to(config: &Config, config_path: &Path) -> Result<()> {
+///
+/// `pub(crate)` so the `whisrs config` save path can be driven end to end in a
+/// temp dir — the composition of "write vocabulary.txt, then write config.toml
+/// with the right list" is where the destructive bugs live, not in either half.
+pub(crate) fn write_config_to(config: &Config, config_path: &Path) -> Result<()> {
     let config_dir = config_path
         .parent()
         .expect("config path should have a parent directory");
@@ -1282,7 +1286,11 @@ fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
 
 /// Create (or truncate) `path` with mode 0600 and write `contents`, fsyncing
 /// before returning.
-fn write_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
+///
+/// `pub(crate)` because every file whisrs writes next to `config.toml` gets the
+/// same treatment — `vocabulary.txt` included, since the feature moves user
+/// data out of the 0600 config into a sibling file.
+pub(crate) fn write_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write as _;
 
     let mut options = fs::OpenOptions::new();
@@ -1479,7 +1487,18 @@ fn setup_user_service() {
             // "Unit does not exist".
             match manager {
                 ServiceManager::Systemd => {
+                    // Not a plain `cp`: the packaged unit ships
+                    // `ExecStart=whisrsd`, and systemd resolves a bare name
+                    // against a compiled-in search path that never contains
+                    // ~/.cargo/bin. Copying it verbatim is the same broken
+                    // unit `write_service_file` exists to avoid, so name the
+                    // resolved path here too.
                     println!("    cp contrib/whisrs.service ~/.config/systemd/user/");
+                    println!(
+                        "    sed -i 's|^ExecStart=.*|ExecStart={}|' \
+                         ~/.config/systemd/user/whisrs.service",
+                        which_whisrsd()
+                    );
                 }
                 ServiceManager::OpenRc => {
                     println!(
@@ -1498,6 +1517,48 @@ fn setup_user_service() {
     }
 }
 
+/// Repoint a systemd unit's `ExecStart=` at `whisrsd_path`, leaving the rest
+/// of the file alone.
+///
+/// Only the binary token is replaced. Everything after it is kept, so a unit
+/// that grows a flag does not silently lose it, and systemd's execution
+/// prefixes (`@-:+!`, which sit *before* the binary) are kept too. Both
+/// details are load-bearing in opposite directions: replacing the whole line
+/// drops arguments, and replacing from the `=` swallows the prefix and turns
+/// `@whisrsd argv0` into a stray argument. `contrib/whisrs.service` exercises
+/// neither shape today, which is exactly why they are pinned by tests.
+///
+/// `ExecStartPre=` and `ExecStartPost=` are deliberately untouched: they are
+/// not the daemon, and rewriting them to the daemon path would be nonsense.
+fn rewrite_exec_start(contents: &str, whisrsd_path: &str) -> String {
+    let mut out = String::with_capacity(contents.len() + whisrsd_path.len());
+    for line in contents.lines() {
+        match line.strip_prefix("ExecStart=") {
+            Some(command) => {
+                // systemd strips whitespace around the value, so `ExecStart= x`
+                // names the binary `x`. Splitting before trimming would re-emit
+                // that name as an argument to the path we just resolved.
+                let command = command.trim_start();
+                let prefixes: &[char] = &['@', '-', ':', '+', '!'];
+                let binary = command.trim_start_matches(prefixes);
+                let prefix = &command[..command.len() - binary.len()];
+
+                out.push_str("ExecStart=");
+                out.push_str(prefix);
+                out.push_str(whisrsd_path);
+                // Everything after the binary is the caller's, keep it verbatim.
+                if let Some((_, args)) = binary.split_once(char::is_whitespace) {
+                    out.push(' ');
+                    out.push_str(args);
+                }
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// Write the service definition for `manager` to `dest`.
 ///
 /// Prefers the file shipped in `contrib/`, falling back to an inline copy for
@@ -1511,7 +1572,24 @@ fn write_service_file(manager: ServiceManager, dest: &Path) -> bool {
     };
 
     if let Some(src) = find_contrib_file(contrib_name) {
-        if let Err(e) = fs::copy(&src, dest) {
+        if manager == ServiceManager::Systemd {
+            // Keep the packaged unit, but write an absolute ExecStart. systemd
+            // resolves a bare `ExecStart=whisrsd` against a compiled-in search
+            // path that never contains ~/.cargo/bin, so the shipped line only
+            // works when the binary landed in /usr/bin or /usr/local/bin.
+            let whisrsd_path = which_whisrsd();
+            let content = match fs::read_to_string(&src) {
+                Ok(contents) => rewrite_exec_start(&contents, &whisrsd_path),
+                Err(e) => {
+                    println!("  {RED}Failed to read service file: {e}{RESET}");
+                    return false;
+                }
+            };
+            if let Err(e) = fs::write(dest, content) {
+                println!("  {RED}Failed to write service file: {e}{RESET}");
+                return false;
+            }
+        } else if let Err(e) = fs::copy(&src, dest) {
             println!("  {RED}Failed to copy service file: {e}{RESET}");
             return false;
         }
@@ -2338,6 +2416,101 @@ mod tests {
         &from_loop[..end]
     }
 
+    /// `whisrs setup` rewrites the packaged unit's `ExecStart=` instead of
+    /// copying it, because systemd resolves a bare `whisrsd` against a
+    /// compiled-in search path that never contains `~/.cargo/bin`. Verified
+    /// directly: a user unit with `ExecStart=whisrsd` fails to run while the
+    /// same unit with an absolute path starts, on the same binary.
+    #[test]
+    fn exec_start_rewrite_repoints_the_binary() {
+        let out = rewrite_exec_start("[Service]\nExecStart=whisrsd\n", "/opt/bin/whisrsd");
+        assert_eq!(out, "[Service]\nExecStart=/opt/bin/whisrsd\n");
+    }
+
+    /// The obvious spelling of the rewrite replaces the whole line, which
+    /// throws away every argument. `contrib/whisrs.service` carries none
+    /// today, so nothing would have caught it: the first flag added to the
+    /// unit would just stop reaching the daemon, on the install path least
+    /// likely to be re-tested.
+    #[test]
+    fn exec_start_rewrite_keeps_arguments() {
+        let out = rewrite_exec_start("ExecStart=whisrsd --foo bar\n", "/opt/bin/whisrsd");
+        assert_eq!(out, "ExecStart=/opt/bin/whisrsd --foo bar\n");
+
+        // Not `split_once(' ')`: systemd tokenises on any whitespace run, and a
+        // space-only split drops a tab-separated flag entirely.
+        let out = rewrite_exec_start("ExecStart=whisrsd\t--foo\n", "/opt/bin/whisrsd");
+        assert_eq!(out, "ExecStart=/opt/bin/whisrsd --foo\n");
+    }
+
+    /// systemd strips whitespace around a directive value, so `ExecStart= x`
+    /// names the binary `x`. Splitting on whitespace before trimming re-emits
+    /// that name as an argument to the path just resolved, producing
+    /// `ExecStart=/abs/whisrsd whisrsd`, which clap rejects with exit 2 while
+    /// `Restart=on-failure` burns its retries. The whole-line replace this
+    /// function replaced was accidentally right here, so the argument fix has
+    /// to not regress it.
+    #[test]
+    fn exec_start_rewrite_trims_before_splitting() {
+        let out = rewrite_exec_start("ExecStart= whisrsd\n", "/opt/bin/whisrsd");
+        assert_eq!(out, "ExecStart=/opt/bin/whisrsd\n");
+
+        let out = rewrite_exec_start("ExecStart=  whisrsd --foo\n", "/opt/bin/whisrsd");
+        assert_eq!(out, "ExecStart=/opt/bin/whisrsd --foo\n");
+    }
+
+    /// systemd's execution prefixes sit before the binary, so a rewrite that
+    /// starts at the `=` swallows them. `@` in particular takes the next token
+    /// as argv[0], so dropping it silently promotes that token to a real
+    /// argument.
+    #[test]
+    fn exec_start_rewrite_keeps_execution_prefixes() {
+        let out = rewrite_exec_start("ExecStart=-whisrsd\n", "/opt/bin/whisrsd");
+        assert_eq!(out, "ExecStart=-/opt/bin/whisrsd\n");
+
+        let out = rewrite_exec_start("ExecStart=@whisrsd argv0 --foo\n", "/opt/bin/whisrsd");
+        assert_eq!(out, "ExecStart=@/opt/bin/whisrsd argv0 --foo\n");
+    }
+
+    /// `ExecStartPre=`/`ExecStartPost=`/`ExecStop=` are not the daemon, so
+    /// repointing them at the daemon path would be nonsense. `starts_with`
+    /// on the bare directive name would match the first two.
+    #[test]
+    fn exec_start_rewrite_leaves_sibling_directives_alone() {
+        let unit = "ExecStartPre=/bin/true\nExecStartPost=/bin/true\nExecStop=/bin/kill\n";
+        assert_eq!(rewrite_exec_start(unit, "/opt/bin/whisrsd"), unit);
+    }
+
+    /// The rewrite is the only edit: comments, blank lines, section order and
+    /// every other directive survive byte-for-byte. Run against the file users
+    /// actually get, so a change to the packaged unit is covered too.
+    #[test]
+    fn exec_start_rewrite_touches_nothing_else_in_the_shipped_unit() {
+        // Not an early return: `Cargo.toml` sets no `include`/`exclude`, so
+        // `contrib/` ships with the crate and is on disk wherever this test
+        // runs. A `return` here would let the whole assertion go vacuous the
+        // day that stops being true.
+        let src = find_contrib_file("whisrs.service").expect("contrib/whisrs.service is on disk");
+        let original = std::fs::read_to_string(&src).expect("contrib unit is readable");
+        let rewritten = rewrite_exec_start(&original, "/opt/bin/whisrsd");
+
+        let changed: Vec<_> = original
+            .lines()
+            .zip(rewritten.lines())
+            .filter(|(before, after)| before != after)
+            .collect();
+        assert_eq!(
+            changed,
+            vec![("ExecStart=whisrsd", "ExecStart=/opt/bin/whisrsd")],
+            "the rewrite edited a line other than ExecStart"
+        );
+        assert_eq!(
+            original.lines().count(),
+            rewritten.lines().count(),
+            "the rewrite added or dropped a line"
+        );
+    }
+
     /// The inline OpenRC fallback is used on `cargo install`, where `contrib/`
     /// is not on disk. It is a hand-maintained copy of
     /// `contrib/openrc/whisrs.initd`, so it silently drifts: an earlier
@@ -2956,6 +3129,17 @@ stray = "keep me"
         assert!(!out.contains("asr = {"), "{out}");
         let reparsed: Config = toml::from_str(&out).unwrap();
         assert!(reparsed.asr_sidecar.is_some());
+
+        // `[local]` aliases `[local-whisper]`, and since #137 gave
+        // `model_path` a serde default it can be wholly unknown as well.
+        let out = rewrite(
+            &dir,
+            "[general]\nbackend = \"groq\"\n\n[local]\nbogus = 1\n",
+        );
+        assert!(!out.contains("bogus = 1"), "{out}");
+        assert!(!out.contains("[local]"), "{out}");
+        let reparsed: Config = toml::from_str(&out).unwrap();
+        assert!(reparsed.local_whisper.is_some());
     }
 
     /// The whole preserve rule as one table, driven through the real writer.

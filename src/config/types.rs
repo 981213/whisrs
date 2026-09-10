@@ -435,6 +435,10 @@ impl Default for AudioConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeepgramConfig {
+    /// Optional in the config file: an empty value means "use
+    /// `WHISRS_DEEPGRAM_API_KEY` from the environment" (validation and the
+    /// backend factories treat an empty key as absent).
+    #[serde(default)]
     pub api_key: String,
     #[serde(default = "default_deepgram_model")]
     pub model: String,
@@ -442,6 +446,10 @@ pub struct DeepgramConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroqConfig {
+    /// Optional in the config file: an empty value means "use
+    /// `WHISRS_GROQ_API_KEY` from the environment" (validation and the
+    /// backend factories treat an empty key as absent).
+    #[serde(default)]
     pub api_key: String,
     #[serde(default = "default_groq_model")]
     pub model: String,
@@ -449,6 +457,10 @@ pub struct GroqConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiConfig {
+    /// Optional in the config file: an empty value means "use
+    /// `WHISRS_OPENAI_API_KEY` from the environment" (validation and the
+    /// backend factories treat an empty key as absent).
+    #[serde(default)]
     pub api_key: String,
     #[serde(default = "default_openai_model")]
     pub model: String,
@@ -506,6 +518,11 @@ impl Default for TtsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalWhisperConfig {
+    /// Path to the ggml model file. Optional in `config.toml`: a
+    /// `[local-whisper]` section kept only for `segmentation` gets
+    /// [`default_whisper_model_path`], the same path `whisrs setup`
+    /// downloads to.
+    #[serde(default = "default_whisper_model_path")]
     pub model_path: String,
     /// Streaming segmentation strategy: `"silence"` (default) splits audio
     /// into phrases at natural pauses and decodes each exactly once;
@@ -529,13 +546,28 @@ impl LocalWhisperConfig {
     }
 }
 
+impl Default for LocalWhisperConfig {
+    /// What a fully absent `[local-whisper]` section resolves to. Matches
+    /// what serde builds for a section that omits every key, so the daemon
+    /// loads the same model either way.
+    fn default() -> Self {
+        Self::new(default_whisper_model_path())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalVoskConfig {
+    /// Path to the Vosk model directory. Optional in `config.toml`: empty is
+    /// the modelled "absent" state and [`Config::validate`] warns on it.
+    #[serde(default)]
     pub model_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalParakeetConfig {
+    /// Path to the Parakeet model directory. Optional in `config.toml`: empty
+    /// is the modelled "absent" state and [`Config::validate`] warns on it.
+    #[serde(default)]
     pub model_path: String,
 }
 
@@ -551,6 +583,10 @@ pub struct AsrSidecarConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiCompatibleRealtimeConfig {
+    /// WebSocket endpoint. Optional in `config.toml` so that omitting it
+    /// reaches [`Config::validate`]'s "no WebSocket URL configured" error
+    /// instead of failing the whole-config parse.
+    #[serde(default)]
     pub url: String,
     #[serde(default = "default_openai_compatible_realtime_model")]
     pub model: String,
@@ -564,6 +600,26 @@ pub struct OpenAiCompatibleRealtimeConfig {
 
 fn default_backend() -> String {
     "groq".to_string()
+}
+/// The `[local-whisper] model_path` a config gets when the section omits it.
+///
+/// Single source for the path `whisrs setup` downloads to: it is the serde
+/// default on [`LocalWhisperConfig::model_path`], the fallback
+/// [`Config::validate`] checks for existence, and (via
+/// [`LocalWhisperConfig::default`]) the fallback the daemon's backend factory
+/// uses when the whole section is absent.
+///
+/// `pub` rather than private like the other `default_*` helpers because that
+/// factory lives in the `whisrsd` binary crate, which cannot see items private
+/// to this one. Its `local_whisper_fallback_is_the_shared_default` test names
+/// this function so the pin is a shared reference and not a fourth copy of the
+/// literal, which is the divergence the pin exists to catch.
+pub fn default_whisper_model_path() -> String {
+    dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("~/.local/share"))
+        .join("whisrs/models/ggml-base.en.bin")
+        .to_string_lossy()
+        .to_string()
 }
 fn default_language() -> String {
     "en".to_string()
@@ -1212,13 +1268,7 @@ impl Config {
                     .local_whisper
                     .as_ref()
                     .map(|l| l.model_path.clone())
-                    .unwrap_or_else(|| {
-                        dirs::data_dir()
-                            .unwrap_or_else(|| std::path::PathBuf::from("~/.local/share"))
-                            .join("whisrs/models/ggml-base.en.bin")
-                            .to_string_lossy()
-                            .to_string()
-                    });
+                    .unwrap_or_else(default_whisper_model_path);
                 if !std::path::Path::new(&model_path).exists() {
                     warnings.push(ConfigWarning {
                         message: format!(
@@ -1785,6 +1835,122 @@ mod tests {
     }
 
     #[test]
+    fn cloud_backend_sections_parse_without_api_key() {
+        // Regression: `api_key` used to be a required field, so a `[groq]`
+        // section kept for its `model` (with the key supplied via the
+        // WHISRS_GROQ_API_KEY env var) was a TOML parse error, and the daemon
+        // discarded the *whole* config: backend, hotkeys and every other
+        // section silently reverted to defaults. The key is optional now; an
+        // empty value means "resolve from the environment".
+        let cfg: Config =
+            toml::from_str("[general]\nbackend = \"groq\"\n[groq]\nmodel = \"whisper-large-v3\"\n")
+                .unwrap();
+        assert_eq!(cfg.general.backend, "groq");
+        let groq = cfg.groq.expect("groq section should deserialize");
+        assert!(groq.api_key.is_empty());
+        assert_eq!(groq.model, "whisper-large-v3");
+
+        // Same for the other cloud sections.
+        let cfg: Config =
+            toml::from_str("[general]\nbackend = \"deepgram\"\n[deepgram]\nmodel = \"nova-3\"\n[openai]\nmodel = \"gpt-4o-transcribe\"\n")
+                .unwrap();
+        assert_eq!(cfg.deepgram.unwrap().api_key, "");
+        assert_eq!(cfg.openai.unwrap().api_key, "");
+    }
+
+    #[test]
+    fn local_whisper_section_parses_without_model_path() {
+        // Same whole-config-discard trap as the cloud `api_key` fields: a
+        // `[local-whisper]` section kept only to pin `segmentation` used to
+        // be a TOML parse error. `model_path` defaults to the path `whisrs
+        // setup` downloads to, never to the empty string, which would reach
+        // `LocalWhisperBackend::new("")`.
+        let cfg: Config = toml::from_str(
+            "[general]\nbackend = \"deepgram\"\n[local-whisper]\nsegmentation = \"silence\"\n",
+        )
+        .unwrap();
+        let local = cfg
+            .local_whisper
+            .expect("local-whisper section should deserialize");
+        assert_eq!(local.model_path, default_whisper_model_path());
+        assert!(!local.model_path.is_empty());
+        assert_eq!(local.segmentation, "silence");
+        assert_eq!(local.phrase_silence_ms, default_phrase_silence_ms());
+    }
+
+    #[test]
+    fn local_model_sections_parse_without_model_path() {
+        // Empty is the modelled "absent" state for these two: `validate`
+        // already treats `model_path.is_empty()` as "model directory not
+        // found. Run 'whisrs setup'", so an omitted key must reach that
+        // warning rather than discard the whole config.
+        let cfg: Config =
+            toml::from_str("[general]\nbackend = \"deepgram\"\n[local-vosk]\n[local-parakeet]\n")
+                .unwrap();
+        assert_eq!(
+            cfg.local_vosk
+                .expect("local-vosk section should deserialize")
+                .model_path,
+            ""
+        );
+        assert_eq!(
+            cfg.local_parakeet
+                .expect("local-parakeet section should deserialize")
+                .model_path,
+            ""
+        );
+    }
+
+    #[test]
+    fn openai_compatible_realtime_without_url_reaches_validate() {
+        // `url` used to be required, so omitting it failed the whole-config
+        // parse and `validate`'s dedicated error was unreachable from a
+        // config file. Now the section deserializes and the user gets the
+        // error that names the key to add.
+        let cfg: Config = toml::from_str(
+            "[general]\nbackend = \"openai-compatible-realtime\"\n\
+             [openai-compatible-realtime]\nmodel = \"Whisper-Tiny\"\n",
+        )
+        .unwrap();
+        let realtime = cfg
+            .openai_compatible_realtime
+            .as_ref()
+            .expect("openai-compatible-realtime section should deserialize");
+        assert_eq!(realtime.url, "");
+        assert_eq!(realtime.model, "Whisper-Tiny");
+
+        // This arm reads no `WHISRS_*_API_KEY`, so the outcome does not
+        // depend on the ambient environment.
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("no WebSocket URL configured"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn whisper_model_path_has_one_source() {
+        // Two routes reach a `model_path` the user never wrote: serde, for a
+        // `[local-whisper]` section that omits the key, and
+        // `LocalWhisperConfig::default`, which is what `validate` and the
+        // daemon's backend factory fall back to when the section is absent
+        // entirely. Both must land on `default_whisper_model_path`, or the
+        // daemon warns about one file and loads another.
+        let defaulted: Config =
+            toml::from_str("[general]\nbackend = \"local-whisper\"\n[local-whisper]\n").unwrap();
+        let from_serde = defaulted
+            .local_whisper
+            .expect("local-whisper section should deserialize");
+        let from_default = LocalWhisperConfig::default();
+
+        assert_eq!(from_serde.model_path, default_whisper_model_path());
+        assert_eq!(from_default.model_path, default_whisper_model_path());
+        assert_eq!(from_serde.model_path, from_default.model_path);
+        assert_eq!(from_serde.segmentation, from_default.segmentation);
+        assert_eq!(from_serde.phrase_silence_ms, from_default.phrase_silence_ms);
+    }
+
+    #[test]
     fn unknown_top_level_key_is_reported() {
         let unknown = unknown_config_keys("bogus = 1\n[general]\nbackend = \"groq\"\n");
         assert_eq!(unknown, vec!["bogus"]);
@@ -1807,8 +1973,6 @@ mod tests {
     fn section_with_only_unknown_keys_reports_leaves() {
         // A whole section the schema never heard of: every leaf inside it is
         // reported, nested ones included, so the user sees which key to fix.
-        // (`[deepgram]` can't stand in here — without `api_key` the document
-        // doesn't deserialize at all and nothing is reported.)
         let unknown = unknown_config_keys("[bogus]\nfoo = 1\n[bogus.nested]\nbar = 2\n");
         assert_eq!(unknown, vec!["bogus.foo", "bogus.nested.bar"]);
     }
@@ -2139,9 +2303,11 @@ mod tests {
 
         // The section aliases (`read` is a key alias, covered by
         // `a_hotkey_alias_is_recanonicalized_while_the_typo_beside_it_survives`)
-        // are the ones the guard has to drop whole. `local` is not among them —
-        // see below for why it cannot be exercised this way.
-        for section in ["asr", "vibevoice"] {
+        // are the ones the guard has to drop whole. `local` joined the loop
+        // when #137 gave `LocalWhisperConfig::model_path` a serde default:
+        // `[local] bogus = 1` deserializes now, so `[local]` can be wholly
+        // unknown exactly like `[asr]`.
+        for section in ["asr", "vibevoice", "local"] {
             let contents = format!("[general]\nbackend = \"groq\"\n[{section}]\nbogus = 1\n");
             // Without this the row can pass for the wrong reason: a fixture
             // that stops deserializing reports nothing, so the node is empty
@@ -2158,44 +2324,6 @@ mod tests {
                 "`[{section}]` marked prunable, so the rewrite would carry both spellings"
             );
         }
-
-        // `local` cannot be put through that loop, because `[local]` can never
-        // be *wholly* unknown: `LocalWhisperConfig::model_path` has no serde
-        // default. Both halves of that are asserted here so the exclusion
-        // cannot quietly rot into a gap.
-        //
-        // Without `model_path` the document does not deserialize, so the scan
-        // reports nothing and there is no node to ask.
-        let bare = "[general]\nbackend = \"groq\"\n[local]\nbogus = 1\n";
-        assert!(
-            unknown_config_keys(bare).is_empty(),
-            "`[local]` deserializes now; `local` belongs in the loop above"
-        );
-        assert!(PreservedKeys::from_config_str(bare)
-            .table("local")
-            .is_empty());
-
-        // With it, `bogus` is genuinely reported — but `model_path` is a known
-        // leaf, so the node does not cover the on-disk table and the writer
-        // never reaches the whole-table question for `[local]` at all.
-        let full = "[general]\nbackend = \"groq\"\n[local]\nmodel_path = \"/m.bin\"\nbogus = 1\n";
-        assert_eq!(
-            unknown_config_keys(full),
-            vec!["local.bogus".to_string()],
-            "fixture no longer reports the typo inside `[local]`"
-        );
-        let document = full.parse::<toml::Table>().expect("fixture is valid TOML");
-        let local = document
-            .get("local")
-            .and_then(toml::Value::as_table)
-            .expect("`[local]` is a table");
-        assert!(
-            !PreservedKeys::from_config_str(full)
-                .table("local")
-                .covers(local),
-            "`[local]` covers its table now, so the whole-table guard does \
-             apply to it — put `local` back in the loop above"
-        );
     }
 
     #[test]
