@@ -3140,6 +3140,16 @@ stray = "keep me"
         assert!(!out.contains("[local]"), "{out}");
         let reparsed: Config = toml::from_str(&out).unwrap();
         assert!(reparsed.local_whisper.is_some());
+
+        // And its inline spelling, through `value_is_preserved`.
+        let out = rewrite(
+            &dir,
+            "local = { bogus = 1 }\n\n[general]\nbackend = \"groq\"\n",
+        );
+        assert!(!out.contains("bogus = 1"), "{out}");
+        assert!(!out.contains("local = {"), "{out}");
+        let reparsed: Config = toml::from_str(&out).unwrap();
+        assert!(reparsed.local_whisper.is_some());
     }
 
     /// The whole preserve rule as one table, driven through the real writer.
