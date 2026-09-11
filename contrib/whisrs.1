@@ -153,6 +153,11 @@ set, since bracketed paste is the foreground program's choice and cannot be
 relied on; and its notification fires even with
 .B [general] notify
 turned off, because nothing was typed.
+With
+.B [input] clipboard_only
+set, there is no refusal: whisrs types and pastes nothing, so the reply is
+copied to the clipboard like any other result. Pasting it into a shell yourself
+carries the same caveat about bracketed paste.
 .PP
 Terminal detection needs
 .BR WindowTracker::get_focused_window_class ,

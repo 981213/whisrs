@@ -407,9 +407,15 @@ async fn command_mode_background_inner(
         .map(|c| is_terminal_class(&c, &context.config.input.terminal_classes))
         .unwrap_or(false);
 
+    // Read once, because the gate, the line clear and `inject_text` below must
+    // agree on it: the gate lets a multi-line reply through at a terminal
+    // under `clipboard_only` only because `inject_text` then copies it
+    // instead of typing it.
+    let clipboard_only = context.config.input.clipboard_only;
+
     // Clean the reply and decide whether it may be typed here (shared with the
     // `[[llm_commands]]` path — see `prepare_llm_injection`).
-    let result = match prepare_llm_injection(&raw, is_terminal) {
+    let result = match prepare_llm_injection(&raw, is_terminal, clipboard_only) {
         LlmInjection::Inject(text) => text,
         LlmInjection::Empty => {
             warn!("command mode: LLM returned no usable text");
@@ -481,7 +487,6 @@ async fn command_mode_background_inner(
     let injector_backend = context.config.input.backend;
     let paste = context.config.input.paste;
     let clipboard_fallback = context.config.input.clipboard_fallback;
-    let clipboard_only = context.config.input.clipboard_only;
     match tokio::task::spawn_blocking(move || {
         if is_terminal && !clipboard_only {
             if let Err(e) = clear_line_via_keyboard(key_delay, injector_backend) {
@@ -905,11 +910,17 @@ async fn llm_command_background_inner(
         .unwrap_or(0.0);
     let history_backend = format!("llm:{}", cmd_ctx.name);
 
+    // Read once, because the gate and `inject_text` below must agree on it:
+    // the gate lets a multi-line reply through at a terminal under
+    // `clipboard_only` only because `inject_text` then copies it instead of
+    // typing it.
+    let clipboard_only = context.config.input.clipboard_only;
+
     // Clean the reply and decide whether it may be typed here — the same gate
     // command mode uses. Multi-line output is normal for these commands
     // (translate a paragraph, draft an email) and is injected as-is; it is only
     // refused when the target is a terminal, where a line break is an Enter.
-    let result = match prepare_llm_injection(&raw, is_terminal) {
+    let result = match prepare_llm_injection(&raw, is_terminal, clipboard_only) {
         LlmInjection::Inject(text) => text,
         LlmInjection::Empty => {
             if context.notify_error() {
@@ -949,7 +960,6 @@ async fn llm_command_background_inner(
     let injector_backend = context.config.input.backend;
     let paste = context.config.input.paste;
     let clipboard_fallback = context.config.input.clipboard_fallback;
-    let clipboard_only = context.config.input.clipboard_only;
     match tokio::task::spawn_blocking(move || {
         inject_text(
             &result_clone,
