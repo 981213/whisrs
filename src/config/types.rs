@@ -1,7 +1,8 @@
 //! Configuration structs, defaults, and validation for `config.toml`.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 use crate::hotkey;
 use crate::llm;
@@ -736,15 +737,33 @@ enum Seg {
 /// because those cases already produce their own error in the daemon's
 /// `load_config`.
 pub fn unknown_config_keys(contents: &str) -> Vec<String> {
-    let Ok(document) = contents.parse::<toml::Table>() else {
-        return Vec::new();
-    };
-    let Ok(config) = toml::from_str::<Config>(contents) else {
-        return Vec::new();
-    };
-    let Ok(known) = toml::Value::try_from(&config) else {
-        return Vec::new();
-    };
+    let mut unknown: Vec<String> = unknown_config_key_paths(contents)
+        .iter()
+        .map(|path| render_path(path))
+        .collect();
+    unknown.sort();
+    unknown.dedup();
+    unknown
+}
+
+/// Everything the unknown-key analysis derives from one config file: the parsed
+/// document, the reserialized (schema-known) view of it, and the confirmed
+/// unknown key paths. Kept together so a caller that needs more than the
+/// rendered list ([`PreservedKeys`]) never repeats the expensive confirmation.
+struct UnknownKeyScan {
+    document: toml::Table,
+    known: toml::Value,
+    paths: Vec<Vec<Seg>>,
+}
+
+/// Run the diff prefilter and the pruning confirmation over `contents`.
+///
+/// Returns `None` in exactly the cases [`unknown_config_keys`] reports nothing
+/// for: not valid TOML, or valid TOML that does not deserialize.
+fn scan_unknown_keys(contents: &str) -> Option<UnknownKeyScan> {
+    let document = contents.parse::<toml::Table>().ok()?;
+    let config = toml::from_str::<Config>(contents).ok()?;
+    let known = toml::Value::try_from(&config).ok()?;
     let mut candidates = Vec::new();
     diff_config_tables(
         &document,
@@ -754,14 +773,300 @@ pub fn unknown_config_keys(contents: &str) -> Vec<String> {
     );
     // The diff is only a prefilter, so a valid config pays for nothing: with no
     // candidates there is no second parse.
-    let mut unknown: Vec<String> = candidates
-        .iter()
+    let paths = candidates
+        .into_iter()
         .filter(|path| key_is_ignored(&document, &known, path))
-        .map(|path| render_path(path))
         .collect();
-    unknown.sort();
-    unknown.dedup();
-    unknown
+    Some(UnknownKeyScan {
+        document,
+        known,
+        paths,
+    })
+}
+
+/// The confirmed-unknown key paths of `contents`, before rendering. Same walk
+/// (and same cost) as [`unknown_config_keys`], which is its only difference
+/// from that function's `Vec<String>`.
+fn unknown_config_key_paths(contents: &str) -> Vec<Vec<Seg>> {
+    scan_unknown_keys(contents)
+        .map(|scan| scan.paths)
+        .unwrap_or_default()
+}
+
+/// The one message the user gets about unknown config keys, shared by every
+/// path that loads a config: the daemon at startup, `whisrs setup`, and
+/// `whisrs config` (issue #116 — only the daemon used to say anything).
+///
+/// Returns `None` when there is nothing to report: the running binary does not
+/// read these keys. `write_config` keeps almost all of them in the file rather
+/// than deleting them — the exception is a section that is entirely unknown but
+/// whose *name* is a serde alias for one the writer emits (`[asr]`,
+/// `[vibevoice]`, `[local]`), which is dropped whole so the rewritten file
+/// cannot carry both spellings (see [`PreservedKeys`]).
+pub fn unknown_keys_warning(config_path: &Path, unknown: &[String]) -> Option<String> {
+    if unknown.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Unknown keys in config at {} ignored: {}",
+        config_path.display(),
+        unknown.join(", ")
+    ))
+}
+
+/// The confirmed-unknown keys of one config file, shaped like the document so
+/// the format-preserving writer can look them up as it walks it.
+///
+/// `write_config` rebuilds the on-disk file to mirror the [`Config`] struct,
+/// which used to delete every key the struct never knew about — including the
+/// very typo the load-time warning had just told the user to fix (issue #116).
+/// Keys named here survive that rewrite instead.
+///
+/// Build this from the *on-disk* text on every write, never from the fresh
+/// serialization and never cached: it describes bytes that are already in the
+/// file, and a stale set would make repeated writes non-byte-stable.
+#[derive(Debug, Default)]
+pub(crate) struct PreservedKeys {
+    /// Confirmed-unknown leaf keys at this level.
+    leaves: BTreeSet<String>,
+    /// Sub-tables holding preserved paths.
+    tables: BTreeMap<String, PreservedKeys>,
+    /// Array-of-tables elements holding preserved paths, keyed by their
+    /// **on-disk** index — `Seg::Index` comes from walking the document, so a
+    /// caller that has re-matched entries must not index with a fresh one.
+    elements: BTreeMap<usize, PreservedKeys>,
+    /// Whether deleting the *whole* on-disk table this node describes leaves a
+    /// file that still deserializes to the same [`Config`]. See
+    /// [`PreservedKeys::table_prunable`].
+    table_prunable: bool,
+}
+
+/// The empty set, returned for every level of the document with nothing to
+/// preserve — which is every level of a config that has no unknown keys.
+static EMPTY_PRESERVED: PreservedKeys = PreservedKeys {
+    leaves: BTreeSet::new(),
+    tables: BTreeMap::new(),
+    elements: BTreeMap::new(),
+    table_prunable: false,
+};
+
+impl PreservedKeys {
+    /// See [`EMPTY_PRESERVED`].
+    pub(crate) const EMPTY: &'static PreservedKeys = &EMPTY_PRESERVED;
+
+    /// Collect the confirmed-unknown keys of a config file.
+    pub(crate) fn from_config_str(contents: &str) -> Self {
+        let Some(scan) = scan_unknown_keys(contents) else {
+            return Self::default();
+        };
+        let mut root = Self::default();
+        for path in &scan.paths {
+            root.insert(path);
+        }
+        root.record_prunable_tables(&scan.document, &scan.document, &scan.known, &[]);
+        root
+    }
+
+    /// True when nothing at this level (or below it) is preserved.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.leaves.is_empty() && self.tables.is_empty() && self.elements.is_empty()
+    }
+
+    /// Whether `key` is a confirmed-unknown leaf at this level.
+    pub(crate) fn contains_leaf(&self, key: &str) -> bool {
+        self.leaves.contains(key)
+    }
+
+    /// The node for the sub-table `key`, or the empty set.
+    pub(crate) fn table(&self, key: &str) -> &PreservedKeys {
+        self.tables.get(key).unwrap_or(Self::EMPTY)
+    }
+
+    /// The node for the array-of-tables element at **on-disk** `index`, or the
+    /// empty set.
+    pub(crate) fn element(&self, index: usize) -> &PreservedKeys {
+        self.elements.get(&index).unwrap_or(Self::EMPTY)
+    }
+
+    /// Whether removing this node's entire on-disk table would leave a file
+    /// that still deserializes to the same [`Config`] — true for `[bogus]`,
+    /// false for `[asr]`.
+    ///
+    /// Only the writer can tell whether that question is even being asked:
+    /// keeping a whole table matters only when the table is *absent from the
+    /// fresh serialization*, and this module cannot see the fresh document.
+    /// So the answer is recorded here and consulted there, in
+    /// `setup::is_preserved`, which by construction runs only for keys `fresh`
+    /// does not carry. Deciding it eagerly here instead is what made the guard
+    /// eat `[hooks]`, `[hotkeys]` and `[overlay.colors]` — sections `fresh`
+    /// *does* carry, where the whole-table question never comes up.
+    pub(crate) fn table_prunable(&self) -> bool {
+        self.table_prunable
+    }
+
+    fn insert(&mut self, path: &[Seg]) {
+        match path {
+            // A bare index is never produced: the walk only reports leaf keys.
+            [] | [Seg::Index(_)] => {}
+            [Seg::Key(key)] => {
+                self.leaves.insert(key.clone());
+            }
+            [Seg::Key(key), rest @ ..] => self.tables.entry(key.clone()).or_default().insert(rest),
+            [Seg::Index(index), rest @ ..] => self.elements.entry(*index).or_default().insert(rest),
+        }
+    }
+
+    /// Record, for every node the writer could keep as a *whole* table, whether
+    /// removing that table changes how the file parses.
+    ///
+    /// `[asr] bogus = 1` is the case that forces this. Every leaf of `[asr]` is
+    /// confirmed-unknown — pruning `bogus` leaves an empty table that still
+    /// deserializes to a default `asr-sidecar` section — so the leaf rule alone
+    /// keeps `[asr]` while the writer also inserts the canonical
+    /// `[asr-sidecar]`. `asr` is a serde *alias* for that section, so the file
+    /// then fails to deserialize with `duplicate field`, the daemon falls back
+    /// to defaults, and the user's whole config is discarded: strictly worse
+    /// than the missing-warning bug. `[asr]` does not prune cleanly, so the
+    /// flag says so and the writer drops it.
+    ///
+    /// This only *records* the answer; nothing is dropped here. Acting on it
+    /// eagerly deleted the nodes for `[hooks]`, `[hotkeys]`, `[overlay]` and
+    /// `[llm]` too, because those sections are all-optional structs whose
+    /// removal also changes the parse (`Some(default)` becomes `None`) — and
+    /// they are the exact typo'd sections this feature exists to protect.
+    /// The difference the writer can see, and this module cannot, is whether
+    /// the fresh serialization already carries the key: see
+    /// [`PreservedKeys::table_prunable`].
+    ///
+    /// Costs one extra prune-and-reparse per fully-unknown table, and nothing
+    /// at all for a config with no unknown keys.
+    ///
+    /// # The guard is safe by accident, not by construction
+    ///
+    /// The question it asks is "does deleting this whole table change the
+    /// parse?", and it stands in for the one that actually matters: "is this
+    /// table name a serde alias for a section the writer also emits?". Those
+    /// two agree only because **every aliased section in the schema is an
+    /// `Option<_>`** (`Config::local_whisper`, `Config::asr_sidecar`): deleting
+    /// `[asr]` turns `Some(default)` into `None`, the parse changes, the guard
+    /// says "not prunable", and the writer drops it instead of emitting it
+    /// beside the canonical `[asr-sidecar]`.
+    ///
+    /// Add `#[serde(alias = ...)]` to a **non-`Option`** `#[serde(default)]`
+    /// section and that stops holding. Deleting such a section reparses to the
+    /// same default, so the guard calls it prunable, the writer keeps the
+    /// aliased spelling *and* writes the canonical one, serde rejects the
+    /// result with `duplicate field`, and the daemon falls back to defaults —
+    /// the user's entire config, silently discarded. That is strictly worse
+    /// than the key-eating bug this module exists to fix. Demonstrated by
+    /// adding `alias = "in"` to the non-`Option` `Config::input`: `[in] bogus =
+    /// 1` rewrites to a file holding both `[in]` and `[input]`.
+    ///
+    /// This is the same trap as the defaulted trait method in CLAUDE.md
+    /// (`WindowTracker::get_focused_window_class`): a rule that happens to hold
+    /// for every implementor today and fails silently for the next one. If you
+    /// need such an alias, do not rely on this guard — decide alias-ness
+    /// explicitly (compare the on-disk table name against the schema's alias
+    /// list) rather than inferring it from a reparse.
+    /// `every_serde_alias_names_an_optional_section` is the tripwire: it fails
+    /// the moment an alias lands on a non-`Option` field.
+    fn record_prunable_tables(
+        &mut self,
+        doc: &toml::Table,
+        document: &toml::Table,
+        known: &toml::Value,
+        prefix: &[Seg],
+    ) {
+        for key in self.tables.keys().cloned().collect::<Vec<_>>() {
+            let Some(child_doc) = doc.get(&key) else {
+                continue;
+            };
+            let mut path = prefix.to_vec();
+            path.push(Seg::Key(key.clone()));
+            match child_doc {
+                toml::Value::Table(child_doc) => {
+                    // Confirm only what the writer could act on: a node that
+                    // does not cover its table is never kept whole, so it never
+                    // needs the flag and never pays for one.
+                    let prunable = self
+                        .tables
+                        .get(&key)
+                        .is_some_and(|child| child.covers(child_doc))
+                        && key_is_ignored(document, known, &path);
+                    if let Some(child) = self.tables.get_mut(&key) {
+                        child.table_prunable = prunable;
+                        // Descend even through a covered table: the writer asks
+                        // the same question again for every sub-table inside a
+                        // section it keeps (`[hooks.bogus]` under `[hooks]`).
+                        child.record_prunable_tables(child_doc, document, known, &path);
+                    }
+                }
+                // `[[llm_commands]]`: the array itself is always in `fresh`, so
+                // only the tables *inside* its entries can be kept whole.
+                toml::Value::Array(array) => {
+                    if let Some(child) = self.tables.get_mut(&key) {
+                        child.record_prunable_elements(array, document, known, &path);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// [`Self::record_prunable_tables`] for the array-of-tables elements at
+    /// this level, indexed by their **on-disk** position.
+    fn record_prunable_elements(
+        &mut self,
+        array: &[toml::Value],
+        document: &toml::Table,
+        known: &toml::Value,
+        prefix: &[Seg],
+    ) {
+        for index in self.elements.keys().copied().collect::<Vec<_>>() {
+            let Some(toml::Value::Table(element_doc)) = array.get(index) else {
+                continue;
+            };
+            let mut path = prefix.to_vec();
+            path.push(Seg::Index(index));
+            if let Some(child) = self.elements.get_mut(&index) {
+                child.record_prunable_tables(element_doc, document, known, &path);
+            }
+        }
+    }
+
+    /// Whether every leaf of `doc` is named by this node — i.e. whether the
+    /// writer would keep the whole table rather than individual keys inside it.
+    ///
+    /// A sub-table with *no leaves at all* (`t = {}`, `a = { b = {} }`, a bare
+    /// `[bogus.emptysub]` header) satisfies that vacuously, and it has no node
+    /// here — there was no leaf to build one from. Reading a missing node as
+    /// "not covered" is what let a single stray `{}` anywhere inside `[bogus]`
+    /// delete the entire section, comments and real keys included: issue #116's
+    /// own symptom, in the code written to fix it. Hence [`has_no_leaves`]
+    /// rather than `is_some_and`, and no `!doc.is_empty()` guard — an empty
+    /// table covers nothing, which is not the same as failing to cover.
+    fn covers(&self, doc: &toml::Table) -> bool {
+        doc.iter().all(|(key, value)| match value {
+            toml::Value::Table(inner) => match self.tables.get(key) {
+                Some(child) => child.covers(inner),
+                None => has_no_leaves(inner),
+            },
+            _ => self.leaves.contains(key),
+        })
+    }
+}
+
+/// Whether `doc` holds no leaf keys at all — only (possibly nested) empty
+/// tables. "Every leaf of this subtree is confirmed-unknown" is then vacuously
+/// true, so such a table must never veto its parent's preservation.
+///
+/// Mirrors [`collect_unknown_leaves`]: anything that is not a table is a leaf,
+/// arrays included.
+fn has_no_leaves(doc: &toml::Table) -> bool {
+    doc.values().all(|value| match value {
+        toml::Value::Table(inner) => has_no_leaves(inner),
+        _ => false,
+    })
 }
 
 /// Render a path as the dotted form shown to the user (`input.past`,
@@ -1732,6 +2037,306 @@ mod tests {
             "[general]\naudio_feedback_volume = nan\nbogus = 1\n[input]\npast = true\n",
         );
         assert_eq!(unknown, vec!["general.bogus", "input.past"]);
+    }
+
+    #[test]
+    fn unknown_keys_warning_is_none_when_nothing_is_unknown() {
+        assert!(unknown_keys_warning(Path::new("/tmp/config.toml"), &[]).is_none());
+    }
+
+    #[test]
+    fn unknown_keys_warning_is_the_one_message_every_path_prints() {
+        // Byte-identical to what the daemon logged before this literal was
+        // shared with the two interactive flows (issue #116).
+        let warning = unknown_keys_warning(
+            Path::new("/home/u/.config/whisrs/config.toml"),
+            &["input.past".to_string(), "deepgram.bogus".to_string()],
+        );
+        assert_eq!(
+            warning.as_deref(),
+            Some(
+                "Unknown keys in config at /home/u/.config/whisrs/config.toml ignored: \
+                 input.past, deepgram.bogus"
+            )
+        );
+    }
+
+    #[test]
+    fn a_clean_config_preserves_nothing() {
+        let preserved = PreservedKeys::from_config_str(
+            "[general]\nbackend = \"groq\"\n[input]\npaste = true\n",
+        );
+        assert!(preserved.is_empty());
+    }
+
+    #[test]
+    fn preserved_keys_name_a_confirmed_typo() {
+        let preserved = PreservedKeys::from_config_str("[input]\npast = true\n");
+        assert!(preserved.table("input").contains_leaf("past"));
+        assert!(!preserved.contains_leaf("input"));
+    }
+
+    #[test]
+    fn preserved_keys_cover_a_wholly_unknown_nested_section() {
+        // Both leaves are confirmed-unknown and pruning `[bogus]` as a whole
+        // changes nothing, so the writer may keep the entire section.
+        let preserved =
+            PreservedKeys::from_config_str("[bogus]\nfoo = 1\n[bogus.nested]\nbar = 2\n");
+        let bogus = preserved.table("bogus");
+        assert!(bogus.contains_leaf("foo"));
+        assert!(bogus.table("nested").contains_leaf("bar"));
+    }
+
+    #[test]
+    fn preserved_keys_exclude_a_known_sibling() {
+        // The subtree rule's whole point: `model_path` really drives a field
+        // (through the `local` -> `local-whisper` alias), so `[local]` is a
+        // *mixed* subtree and the writer must drop it rather than emit it
+        // beside the canonical section.
+        let preserved = PreservedKeys::from_config_str(
+            "[general]\nbackend = \"local\"\n[local]\nmodel_path = \"/m.bin\"\nbogus = 1\n",
+        );
+        let local = preserved.table("local");
+        assert!(local.contains_leaf("bogus"));
+        assert!(!local.contains_leaf("model_path"));
+    }
+
+    #[test]
+    fn a_wholly_unknown_alias_section_is_not_prunable() {
+        for section in ["asr", "vibevoice"] {
+            let contents = format!("[general]\nbackend = \"groq\"\n[{section}]\nbogus = 1\n");
+
+            // Every leaf of the section is confirmed-unknown — pruning `bogus`
+            // leaves an empty table that still deserializes to a default
+            // `asr-sidecar` section — so the leaf rule alone would keep it.
+            assert_eq!(
+                unknown_config_keys(&contents),
+                vec![format!("{section}.bogus")],
+                "fixture no longer exercises the whole-table guard"
+            );
+
+            // But the name is a serde alias for `asr-sidecar`, which the writer
+            // also emits: keeping both makes the file fail to deserialize
+            // outright. The leaf still has to be *named* (the warning quotes
+            // it); it is the whole-table flag that stops the writer keeping it.
+            let preserved = PreservedKeys::from_config_str(&contents);
+            assert!(preserved.table(section).contains_leaf("bogus"));
+            assert!(
+                !preserved.table(section).table_prunable(),
+                "`[{section}]` marked prunable, so the rewrite would carry both spellings"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wholly_unknown_root_inline_alias_is_not_prunable() {
+        // Same section, spelled as a root inline table. `toml` parses it to the
+        // same `Value::Table`, so the guard must reach it too.
+        let preserved =
+            PreservedKeys::from_config_str("asr = { bogus = 1 }\n[general]\nbackend = \"groq\"\n");
+        assert!(preserved.table("asr").contains_leaf("bogus"));
+        assert!(!preserved.table("asr").table_prunable());
+    }
+
+    #[test]
+    fn a_wholly_unknown_section_is_prunable() {
+        // The other side of the same flag: `[bogus]` is not an alias for
+        // anything, so deleting it changes nothing and the writer may keep it.
+        let preserved =
+            PreservedKeys::from_config_str("[bogus]\nfoo = 1\n[bogus.nested]\nbar = 2\n");
+        assert!(preserved.table("bogus").table_prunable());
+        assert!(
+            preserved.table("bogus").table("nested").table_prunable(),
+            "the flag must be recorded below a covered table too"
+        );
+    }
+
+    #[test]
+    fn an_all_optional_section_keeps_its_only_key_when_that_key_is_a_typo() {
+        // The class of config the whole feature exists for, and the one the
+        // eager version of the guard deleted: a section the schema *knows*
+        // whose fields are all optional, holding nothing but a typo. Removing
+        // such a section changes the parse (`Some(default)` -> `None`), so it
+        // is not prunable — but its name is in the fresh serialization, so the
+        // writer never asks, and the leaf must survive to be preserved there.
+        for (section, key) in [
+            ("hotkeys", "speek"),
+            ("hooks", "media_autopause"),
+            ("llm", "bogus"),
+            ("tts", "bogus"),
+        ] {
+            let contents = format!("[general]\nbackend = \"groq\"\n[{section}]\n{key} = 1\n");
+            let preserved = PreservedKeys::from_config_str(&contents);
+            assert!(
+                preserved.table(section).contains_leaf(key),
+                "`{section}.{key}` dropped from the preserve set"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_table_is_covered_vacuously_and_keeps_its_section_prunable() {
+        // An empty table has no leaves, so "every leaf of this subtree is
+        // confirmed-unknown" is trivially true of it — but it contributes no
+        // path, so there is no node for it and `covers` used to read the
+        // missing node as a failure. One `{}` then made `[bogus]` unprunable
+        // and the writer deleted the section around it.
+        for shape in [
+            "empty_table = {}",
+            "a = { b = {} }",
+            "a = { b = { c = {} } }",
+        ] {
+            let contents =
+                format!("[general]\nbackend = \"groq\"\n[bogus]\nimportant = 1\n{shape}\n");
+
+            // The empty table names nothing, so it is not in the warning.
+            assert_eq!(
+                unknown_config_keys(&contents),
+                vec!["bogus.important".to_string()],
+                "fixture no longer exercises the leafless-table rule ({shape})"
+            );
+
+            let preserved = PreservedKeys::from_config_str(&contents);
+            assert!(preserved.table("bogus").contains_leaf("important"));
+            assert!(
+                preserved.table("bogus").table_prunable(),
+                "`{shape}` vetoed `[bogus]`, so the writer would delete the section"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_empty_subtable_header_keeps_its_section_prunable() {
+        // Same rule, spelled as a header rather than an inline `{}`.
+        let preserved = PreservedKeys::from_config_str(
+            "[general]\nbackend = \"groq\"\n[bogus]\nimportant = 1\n[bogus.emptysub]\n",
+        );
+        assert!(preserved.table("bogus").table_prunable());
+    }
+
+    #[test]
+    fn an_empty_subtable_does_not_make_an_alias_section_prunable() {
+        // The vacuous rule makes `[asr]` *cover* itself, so the whole-table
+        // question now gets asked where it previously was skipped. The answer
+        // must still be no: `asr` is a serde alias for the `asr-sidecar`
+        // section the writer emits, and keeping both is a `duplicate field`
+        // error, i.e. the daemon discards the user's entire config.
+        let contents = "[general]\nbackend = \"groq\"\n[asr]\nbogus = 1\n[asr.empty]\n";
+        let preserved = PreservedKeys::from_config_str(contents);
+        assert!(preserved.table("asr").contains_leaf("bogus"));
+        assert!(
+            !preserved.table("asr").table_prunable(),
+            "`[asr]` marked prunable, so the rewrite would carry both spellings"
+        );
+    }
+
+    /// The tripwire for the hazard documented on `record_prunable_tables`.
+    ///
+    /// That guard infers "this table name is a serde alias" from "deleting the
+    /// table changes the parse". The two agree only because every aliased field
+    /// in the schema is an `Option<_>`. Put an alias on a non-`Option`
+    /// `#[serde(default)]` field and deleting it reparses to the same default,
+    /// the guard calls it prunable, and the writer emits both the alias and the
+    /// canonical name — `duplicate field`, config discarded, defaults loaded.
+    /// Demonstrated with `alias = "in"` on `Config::input`.
+    ///
+    /// So pin both halves: which aliases exist, and that each one sits on an
+    /// `Option`. Adding an alias fails this test; the fix is to read the
+    /// warning on `record_prunable_tables` before touching the assertion.
+    ///
+    /// This is a text scan, not reflection, so it sees exactly the files listed
+    /// below: `src/config/types.rs` and `src/llm.rs` — today's complete set of
+    /// modules declaring a `Deserialize` type reachable from [`Config`]
+    /// (`llm::LlmConfig` and `llm::LlmCommandConfig` are the ones outside this
+    /// file). Put a config struct in a third module and its aliases are
+    /// invisible here until that file joins the list.
+    #[test]
+    fn every_serde_alias_names_an_optional_section() {
+        const NEEDLE: &str = "alias = \"";
+
+        // alias -> (file, the source line of the field it annotates)
+        let mut found: BTreeMap<String, (&str, &str)> = BTreeMap::new();
+        for (file, source) in [
+            ("src/config/types.rs", include_str!("types.rs")),
+            ("src/llm.rs", include_str!("../llm.rs")),
+        ] {
+            let lines: Vec<&str> = source.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                if !line.trim_start().starts_with("#[serde(") || !line.contains(NEEDLE) {
+                    continue;
+                }
+                let field = *lines
+                    .get(index + 1)
+                    .expect("a serde attribute is followed by the field it annotates");
+                for chunk in line.split(NEEDLE).skip(1) {
+                    let alias = chunk.split('"').next().expect("alias is a quoted string");
+                    found.insert(alias.to_string(), (file, field));
+                }
+            }
+        }
+
+        assert_eq!(
+            found.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "asr".to_string(),
+                "local".to_string(),
+                "read".to_string(),
+                "vibevoice".to_string()
+            ],
+            "the schema's serde aliases changed; see the hazard note on \
+             `record_prunable_tables` before updating this list"
+        );
+
+        for (alias, (file, field)) in &found {
+            assert!(
+                field.contains("Option<"),
+                "`{alias}` aliases the non-`Option` field `{}` in {file}. The \
+                 whole-table guard in `record_prunable_tables` infers \
+                 alias-ness from a reparse, which only works for `Option<_>`: \
+                 deleting a non-`Option` `#[serde(default)]` section reparses \
+                 to the same value, so the guard would keep the aliased \
+                 spelling *and* the canonical one, and serde rejects that with \
+                 `duplicate field`.",
+                field.trim()
+            );
+        }
+
+        // The section aliases (`read` is a key alias, covered by
+        // `a_hotkey_alias_is_recanonicalized_while_the_typo_beside_it_survives`)
+        // are the ones the guard has to drop whole. `local` joined the loop
+        // when #137 gave `LocalWhisperConfig::model_path` a serde default:
+        // `[local] bogus = 1` deserializes now, so `[local]` can be wholly
+        // unknown exactly like `[asr]`.
+        for section in ["asr", "vibevoice", "local"] {
+            let contents = format!("[general]\nbackend = \"groq\"\n[{section}]\nbogus = 1\n");
+            // Without this the row can pass for the wrong reason: a fixture
+            // that stops deserializing reports nothing, so the node is empty
+            // and `table_prunable` is false however the guard behaves.
+            assert_eq!(
+                unknown_config_keys(&contents),
+                vec![format!("{section}.bogus")],
+                "fixture no longer exercises the whole-table guard"
+            );
+            assert!(
+                !PreservedKeys::from_config_str(&contents)
+                    .table(section)
+                    .table_prunable(),
+                "`[{section}]` marked prunable, so the rewrite would carry both spellings"
+            );
+        }
+    }
+
+    #[test]
+    fn a_nested_all_optional_section_keeps_its_typo() {
+        // `[overlay.colors]`: both levels are all-optional, so the eager guard
+        // pruned the `overlay` node and took `colors` down with it.
+        let preserved = PreservedKeys::from_config_str(
+            "[general]\nbackend = \"groq\"\n[overlay.colors]\nbogos = 1\n",
+        );
+        assert!(preserved
+            .table("overlay")
+            .table("colors")
+            .contains_leaf("bogos"));
     }
 
     #[test]

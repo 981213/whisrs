@@ -28,7 +28,12 @@ pub fn run_config_menu() -> Result<()> {
     println!("\n{BOLD}whisrs config{RESET} — edit ~/.config/whisrs/config.toml\n");
 
     let (mut config, fresh) = match setup::load_existing_config() {
-        Some(cfg) => (cfg, false),
+        Some((cfg, unknown)) => {
+            // Warn at load, not at save: the keys are about to be shown back to
+            // the user as a config that looks fine (issue #116).
+            setup::print_unknown_keys_warning(&unknown);
+            (cfg, false)
+        }
         None => {
             println!(
                 "  {YELLOW}No config file found — starting from defaults.{RESET} \
@@ -1172,6 +1177,33 @@ mod tests {
                 "edit_hotkeys never prompts for `{field}`, so editing hotkeys deletes it"
             );
         }
+    }
+
+    /// `run_config_menu` is pure dialoguer IO, so pin the call the same way:
+    /// issue #116 was `whisrs config` loading a config with a typo'd key and
+    /// saying nothing about it, then deleting the key on save.
+    #[test]
+    fn run_config_menu_warns_about_unknown_keys_at_load() {
+        let source = include_str!("edit.rs");
+        let body = source
+            .split("pub fn run_config_menu(")
+            .nth(1)
+            .expect("edit.rs defines run_config_menu")
+            .split("\n}\n")
+            .next()
+            .expect("run_config_menu has a body");
+
+        let warn_at = body
+            .find("print_unknown_keys_warning(&unknown)")
+            .expect("run_config_menu never warns about unknown keys");
+        // Before the menu, exactly as `run_setup` warns before its prompt: a
+        // warning printed after the menu opens scrolls past unseen, and
+        // "Discard & exit" returns without ever reaching it.
+        let prompt_at = body.find("Select::new()").expect("run_config_menu prompts");
+        assert!(
+            warn_at < prompt_at,
+            "the warning must be printed before the menu"
+        );
     }
 
     fn terms(list: &[&str]) -> Vec<String> {

@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tracing::{debug, error, info, warn};
 
-use whisrs::config::types::unknown_config_keys;
+use whisrs::config::types::{unknown_config_keys, unknown_keys_warning};
 use whisrs::service::ServiceManager;
 use whisrs::Config;
 
@@ -82,14 +82,9 @@ fn load_config_toml_at(config_path: &std::path::Path) -> (Config, Option<String>
                 Ok(config) => {
                     info!("loaded config from {}", config_path.display());
                     let unknown = unknown_config_keys(&contents);
-                    if unknown.is_empty() {
+                    let Some(msg) = unknown_keys_warning(config_path, &unknown) else {
                         return (config, None);
-                    }
-                    let msg = format!(
-                        "Unknown keys in config at {} ignored: {}",
-                        config_path.display(),
-                        unknown.join(", ")
-                    );
+                    };
                     warn!("{msg}");
                     return (config, Some(msg));
                 }
