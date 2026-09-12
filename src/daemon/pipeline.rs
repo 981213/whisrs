@@ -17,6 +17,7 @@ use whisrs::state::Action;
 use whisrs::transcription::{TranscriptionBackend, TranscriptionConfig};
 use whisrs::window::WindowTracker;
 use whisrs::{Config, InjectorBackend, State};
+use xkb_type::ClipboardBackend;
 
 use crate::context::{DaemonContext, DaemonState};
 use crate::factory::get_model_for_backend;
@@ -174,33 +175,14 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
             })
             .await;
 
-        // `[input] clipboard_fallback` / `[input] clipboard_only`: leave the
-        // full accumulated transcript in the clipboard once the recording
-        // stops — as a manual-fix fallback for silent injection failures, or
-        // as the only output in copy-only mode (see
-        // `InputConfig::clipboard_fallback` / `::clipboard_only`). Skipped
-        // when nothing was typed — copying an empty string would clobber
-        // the user's clipboard for nothing.
-        //
-        // `whisrs cancel` discards: it produces no clipboard output either.
-        // The batch path already behaves that way for free (cancel throws the
-        // audio away and `process_recording_batch` never runs), so without
-        // this check the same keypress would leave text in the clipboard on a
-        // streaming backend and nothing on a batch one — the streaming/batch
-        // divergence class from #54.
-        if (clipboard_fallback || clipboard_only)
-            && !full_text.is_empty()
-            && !clipboard_cancel.load(Ordering::SeqCst)
-        {
-            let text = full_text.clone();
-            match tokio::task::spawn_blocking(move || xkb_type::default_clipboard().set_text(&text))
-                .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!("failed to set clipboard fallback: {e:#}"),
-                Err(e) => warn!("failed to join clipboard fallback task: {e}"),
-            }
-        }
+        write_streaming_clipboard(
+            &full_text,
+            clipboard_fallback,
+            clipboard_only,
+            clipboard_cancel.load(Ordering::SeqCst),
+            Arc::from(xkb_type::default_clipboard()),
+        )
+        .await;
 
         full_text
     });
@@ -432,6 +414,52 @@ where
     }
 
     full_text
+}
+
+/// Leave the streaming run's final transcript in the clipboard — or
+/// deliberately leave the clipboard alone.
+///
+/// `[input] clipboard_fallback` / `[input] clipboard_only`: the full
+/// accumulated transcript is written to the clipboard once the recording
+/// stops — as a manual-fix fallback for silent injection failures, or as the
+/// only output in copy-only mode (see
+/// [`whisrs::InputConfig::clipboard_fallback`] /
+/// [`whisrs::InputConfig::clipboard_only`]). Skipped when nothing was typed
+/// — copying an empty string would clobber the user's clipboard for nothing.
+/// "Nothing" is an empty transcript, not an empty typing run: under
+/// `clipboard_only` nothing is ever typed and the copy is still the point.
+///
+/// `whisrs cancel` discards: it produces no clipboard output either, which is
+/// what `cancelled` carries in. The batch path already behaves that way for
+/// free (cancel throws the audio away and `process_recording_batch` never
+/// runs), so without that check the same keypress would leave text in the
+/// clipboard on a streaming backend and nothing on a batch one — the
+/// streaming/batch divergence class from #54.
+///
+/// Returns `()`: a copy failure is only warned about, never propagated. The
+/// caller is the typing task, whose value is the transcript itself.
+///
+/// `clipboard` is an `Arc` because the write happens inside `spawn_blocking`,
+/// whose closure must be `'static + Send` — a `&dyn ClipboardBackend` cannot
+/// cross that boundary. The production call site wraps
+/// `xkb_type::default_clipboard()`; tests pass a double.
+async fn write_streaming_clipboard(
+    text: &str,
+    clipboard_fallback: bool,
+    clipboard_only: bool,
+    cancelled: bool,
+    clipboard: Arc<dyn ClipboardBackend>,
+) {
+    if (!clipboard_fallback && !clipboard_only) || text.is_empty() || cancelled {
+        return;
+    }
+
+    let text = text.to_string();
+    match tokio::task::spawn_blocking(move || clipboard.set_text(&text)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("failed to set clipboard fallback: {e:#}"),
+        Err(e) => warn!("failed to join clipboard fallback task: {e}"),
+    }
 }
 
 /// Where a batch transcription request originated. Selects the per-path
@@ -1813,6 +1841,172 @@ mod tests {
         assert_eq!(
             history_backend_tag("openai-realtime", outcome.post_processed),
             "openai-realtime"
+        );
+    }
+
+    /// Scripted clipboard double, copied verbatim from the `injection.rs`
+    /// tests. Deliberately a third copy of that exact shape rather than a
+    /// fourth shape or a shared helper: this crate has no test-support
+    /// module, and adding one would mean reworking the doubles in
+    /// `injection.rs` and `selection.rs`, which this change has no business
+    /// touching. `texts` is the sequence of `get_text` results
+    /// (each call consumes the front entry; the last entry is sticky),
+    /// `writes` records every `set_text` so tests can assert the
+    /// fallback/restore policy byte-for-byte — including that nothing is
+    /// ever written. An empty `texts` list makes any `get_text` panic, which
+    /// is itself an assertion in the streaming tests below (the streaming
+    /// path must never read the clipboard).
+    struct ScriptedClipboard {
+        texts: StdMutex<Vec<Option<String>>>,
+        writes: StdMutex<Vec<String>>,
+        fail_writes: bool,
+    }
+
+    impl ScriptedClipboard {
+        fn new(texts: &[Option<&str>]) -> Self {
+            Self {
+                texts: StdMutex::new(texts.iter().map(|t| t.map(String::from)).collect()),
+                writes: StdMutex::new(Vec::new()),
+                fail_writes: false,
+            }
+        }
+
+        fn writes(&self) -> Vec<String> {
+            self.writes.lock().unwrap().clone()
+        }
+    }
+
+    impl ClipboardBackend for ScriptedClipboard {
+        fn get_text(&self) -> anyhow::Result<String> {
+            let mut texts = self.texts.lock().unwrap();
+            assert!(!texts.is_empty(), "get_text called with no scripted result");
+            let head = if texts.len() > 1 {
+                texts.remove(0)
+            } else {
+                texts[0].clone()
+            };
+            head.ok_or_else(|| anyhow::anyhow!("clipboard holds non-text content"))
+        }
+
+        fn set_text(&self, text: &str) -> anyhow::Result<()> {
+            if self.fail_writes {
+                return Err(anyhow::anyhow!("mock clipboard write failure"));
+            }
+            self.writes.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+
+        fn get_primary_selection(&self) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    /// The plain stop path with `[input] clipboard_fallback` on: exactly one
+    /// copy of the final transcript, never a partial delta and never a
+    /// duplicate. The empty script is itself an assertion — the streaming
+    /// path must never *read* the clipboard, so any read panics.
+    #[tokio::test]
+    async fn streaming_stop_copies_the_final_transcript_once() {
+        let clipboard = Arc::new(ScriptedClipboard::new(&[]));
+
+        write_streaming_clipboard(
+            "hello world",
+            /* clipboard_fallback = */ true,
+            /* clipboard_only = */ false,
+            /* cancelled = */ false,
+            clipboard.clone(),
+        )
+        .await;
+
+        assert_eq!(clipboard.writes(), vec!["hello world".to_string()]);
+    }
+
+    /// `[input] clipboard_only` reaches the same copy on its own, with the
+    /// fallback off: in copy-only mode the clipboard write is the entire
+    /// output of the dictation, so gating it on `clipboard_fallback` would
+    /// silently produce nothing at all.
+    #[tokio::test]
+    async fn streaming_clipboard_only_copies_the_final_transcript() {
+        let clipboard = Arc::new(ScriptedClipboard::new(&[]));
+
+        write_streaming_clipboard(
+            "hello world",
+            /* clipboard_fallback = */ false,
+            /* clipboard_only = */ true,
+            /* cancelled = */ false,
+            clipboard.clone(),
+        )
+        .await;
+
+        assert_eq!(clipboard.writes(), vec!["hello world".to_string()]);
+    }
+
+    /// `whisrs cancel` discards. The transcript is non-empty and the
+    /// fallback is on, so `cancelled` is the only thing standing between
+    /// this run and a clipboard write — which is the point: the batch path
+    /// produces nothing on cancel, and a streaming backend that copied
+    /// anyway would be the streaming/batch divergence class from #54.
+    #[tokio::test]
+    async fn streaming_cancel_copies_nothing() {
+        let clipboard = Arc::new(ScriptedClipboard::new(&[]));
+
+        write_streaming_clipboard(
+            "hello world",
+            /* clipboard_fallback = */ true,
+            /* clipboard_only = */ false,
+            /* cancelled = */ true,
+            clipboard.clone(),
+        )
+        .await;
+
+        assert!(
+            clipboard.writes().is_empty(),
+            "a cancelled run must leave the clipboard exactly as it found it"
+        );
+    }
+
+    /// A recording that transcribed to nothing (silence, an accidental
+    /// tap) must not overwrite whatever the user already had copied. The
+    /// fallback is on and the run was not cancelled, so the empty string is
+    /// the only reason to skip.
+    #[tokio::test]
+    async fn streaming_empty_transcript_never_clobbers_the_clipboard() {
+        let clipboard = Arc::new(ScriptedClipboard::new(&[]));
+
+        write_streaming_clipboard(
+            "",
+            /* clipboard_fallback = */ true,
+            /* clipboard_only = */ false,
+            /* cancelled = */ false,
+            clipboard.clone(),
+        )
+        .await;
+
+        assert!(
+            clipboard.writes().is_empty(),
+            "an empty transcript must not clobber the user's clipboard"
+        );
+    }
+
+    /// The default configuration: both flags off, a perfectly ordinary
+    /// successful dictation. Typing already delivered the text, so the
+    /// clipboard is none of our business.
+    #[tokio::test]
+    async fn streaming_without_fallback_never_touches_the_clipboard() {
+        let clipboard = Arc::new(ScriptedClipboard::new(&[]));
+
+        write_streaming_clipboard(
+            "hello world",
+            /* clipboard_fallback = */ false,
+            /* clipboard_only = */ false,
+            /* cancelled = */ false,
+            clipboard.clone(),
+        )
+        .await;
+
+        assert!(
+            clipboard.writes().is_empty(),
+            "clipboard must stay untouched when neither clipboard mode is on"
         );
     }
 }
