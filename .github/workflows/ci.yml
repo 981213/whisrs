@@ -37,6 +37,22 @@ jobs:
       - name: Test
         run: cargo test
 
+      # The GPU features are passthroughs to whisper-rs and are never compiled
+      # here: a Vulkan build needs shaderc, and no runner has a CUDA or ROCm
+      # toolchain. Resolving them takes about a second and is enough to catch an
+      # upstream feature rename, which would otherwise surface as a resolver
+      # error for the first user running `cargo install whisrs --features cuda`.
+      # `--locked` also pins the lock file against a future upstream change that
+      # adds a dependency edge to one of them (today only `vulkan` has one,
+      # `dep:libc`).
+      - name: GPU feature flags resolve
+        run: |
+          for feature in vulkan cuda hipblas; do
+            echo "::group::$feature"
+            cargo metadata --locked --format-version 1 --features "$feature" > /dev/null
+            echo "::endgroup::"
+          done
+
   release-build:
     name: Release build — ${{ matrix.name }}
     runs-on: ubuntu-latest
