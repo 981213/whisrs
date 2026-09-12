@@ -407,9 +407,15 @@ async fn command_mode_background_inner(
         .map(|c| is_terminal_class(&c, &context.config.input.terminal_classes))
         .unwrap_or(false);
 
+    // Read once, because the gate, the line clear and `inject_text` below must
+    // agree on it: the gate lets a multi-line reply through at a terminal
+    // under `clipboard_only` only because `inject_text` then copies it
+    // instead of typing it.
+    let clipboard_only = context.config.input.clipboard_only;
+
     // Clean the reply and decide whether it may be typed here (shared with the
     // `[[llm_commands]]` path — see `prepare_llm_injection`).
-    let result = match prepare_llm_injection(&raw, is_terminal) {
+    let result = match prepare_llm_injection(&raw, is_terminal, clipboard_only) {
         LlmInjection::Inject(text) => text,
         LlmInjection::Empty => {
             warn!("command mode: LLM returned no usable text");
@@ -481,7 +487,6 @@ async fn command_mode_background_inner(
     let injector_backend = context.config.input.backend;
     let paste = context.config.input.paste;
     let clipboard_fallback = context.config.input.clipboard_fallback;
-    let clipboard_only = context.config.input.clipboard_only;
     match tokio::task::spawn_blocking(move || {
         if is_terminal && !clipboard_only {
             if let Err(e) = clear_line_via_keyboard(key_delay, injector_backend) {
@@ -877,14 +882,30 @@ async fn llm_command_background_inner(
 
     let raw = llm::rewrite_text(&cmd_ctx.llm_config, &text, &cmd_ctx.instruction).await?;
 
+    // Read once, because the refocus, the gate and `inject_text` below must
+    // all agree on it. Under `clipboard_only` the refocus is skipped and the
+    // gate lets a multi-line reply through at a terminal, both only because
+    // `inject_text` then copies the reply instead of typing it.
+    let clipboard_only = context.config.input.clipboard_only;
+
     // Restore window focus before anything else looks at what is focused: the
     // gate below and the paste combo both key off the target window, and the
-    // focus may have moved during the recording.
-    if let Some(wid) = &window_id {
-        if let Err(e) = context.window_tracker.focus_window(wid) {
-            warn!("failed to restore window focus: {e}");
-        } else {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // focus may have moved during the recording or while the reply was
+    // generated.
+    //
+    // Skipped under `[input] clipboard_only`: nothing is injected, so raising
+    // the old window would only yank focus away from wherever the user moved
+    // to (and burn 100 ms doing it). Matches the refocus gate in
+    // `process_recording_batch`. Neither the gate nor the paste combo looks at
+    // the target in that mode, so an `is_terminal` read off whatever window
+    // has focus now changes nothing.
+    if !clipboard_only {
+        if let Some(wid) = &window_id {
+            if let Err(e) = context.window_tracker.focus_window(wid) {
+                warn!("failed to restore window focus: {e}");
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
         }
     }
 
@@ -908,8 +929,9 @@ async fn llm_command_background_inner(
     // Clean the reply and decide whether it may be typed here — the same gate
     // command mode uses. Multi-line output is normal for these commands
     // (translate a paragraph, draft an email) and is injected as-is; it is only
-    // refused when the target is a terminal, where a line break is an Enter.
-    let result = match prepare_llm_injection(&raw, is_terminal) {
+    // refused when the target is a terminal, where a line break is an Enter
+    // (never under `clipboard_only`, see above).
+    let result = match prepare_llm_injection(&raw, is_terminal, clipboard_only) {
         LlmInjection::Inject(text) => text,
         LlmInjection::Empty => {
             if context.notify_error() {
@@ -949,7 +971,6 @@ async fn llm_command_background_inner(
     let injector_backend = context.config.input.backend;
     let paste = context.config.input.paste;
     let clipboard_fallback = context.config.input.clipboard_fallback;
-    let clipboard_only = context.config.input.clipboard_only;
     match tokio::task::spawn_blocking(move || {
         inject_text(
             &result_clone,

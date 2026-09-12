@@ -130,6 +130,10 @@ clipboard_fallback = false
 # injected at the cursor — no keystrokes, no Ctrl+V. Overrides paste and
 # clipboard_fallback (both become no-ops). Handy for a "dictate to clipboard"
 # workflow. Default: false.
+#
+# This also covers the reply of `whisrs command` and `[[llm_commands]]`. A
+# multi-line reply is copied even with a terminal focused: nothing is typed,
+# so it is not refused (see "What happens to the LLM's reply").
 clipboard_only = false
 # Extra window classes to treat as terminal emulators, checked alongside the
 # built-in list. Default: [] (built-in list only).
@@ -191,6 +195,8 @@ clipboard_only = false
 #     only.
 #   * with `paste = true`, injection sends Ctrl+Shift+V instead of Ctrl+V. This
 #     one is a fix, not a loss: Ctrl+V at a terminal is readline quoted-insert.
+# With `clipboard_only = true` only the third applies: nothing is typed or
+# pasted, so there is no line clear, no refusal and no Ctrl+Shift+V.
 terminal_classes = []
 
 [groq]
@@ -424,6 +430,11 @@ terminal's, and it is off inside many TUI programs and in some readline modes.
 whisrs cannot see which is the case from the window class alone, and refusing
 wrongly costs you one `whisrs log` lookup where injecting wrongly runs commands
 you never read, so it refuses either way.
+
+The refusal does not apply with `[input] clipboard_only = true`. whisrs then
+types and pastes nothing, so a multi-line reply is copied to the clipboard like
+any other. If you paste it into a shell yourself, the bracketed paste caveat
+above still applies.
 
 Terminal detection needs the compositor to report the focused window class,
 which today means Hyprland, Niri, Sway and X11. On KDE and GNOME a terminal is

@@ -21,7 +21,9 @@ const CLIPBOARD_RESTORE_DELAY: std::time::Duration = std::time::Duration::from_m
 /// reach the injector and the caller has to tell the user which one happened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LlmInjection {
-    /// Cleaned text, safe to inject at this target.
+    /// Cleaned text, safe to inject at this target. Under `clipboard_only`
+    /// there is no target (the text is only copied), so a multi-line reply
+    /// with a terminal focused lands here too.
     Inject(String),
     /// Nothing usable came back: an empty reply, an all-whitespace one, or a
     /// code fence with nothing in it.
@@ -66,12 +68,29 @@ pub(crate) enum LlmInjection {
 /// commands the user never read. So the gate stays target-shaped, not
 /// injection-method-shaped, and this function keeps a signature that cannot
 /// express the weaker rule.
-pub(crate) fn prepare_llm_injection(raw: &str, is_terminal: bool) -> LlmInjection {
+///
+/// **`[input] clipboard_only` is a parameter, for the opposite reason.** It
+/// does not weaken the hazard, it removes it: in that mode [`inject_text`]
+/// writes the text to the clipboard and returns, so not one keystroke reaches
+/// the focused window and a line break has nothing to submit. That is not an
+/// injection method, it is the absence of one — the gate is still
+/// target-shaped, and `clipboard_only` means there is no target. Refusing
+/// there would withhold the reply from the clipboard, the one place the user
+/// asked for it, to guard against a keystroke that is never sent (#121). The
+/// caller must pass the same value it hands to [`inject_text`]: a multi-line
+/// [`LlmInjection::Inject`] decided under `clipboard_only` is only safe
+/// because it will be copied, not typed. Cleaning and
+/// [`LlmInjection::Empty`] do not depend on it.
+pub(crate) fn prepare_llm_injection(
+    raw: &str,
+    is_terminal: bool,
+    clipboard_only: bool,
+) -> LlmInjection {
     let cleaned = llm::clean_llm_output(raw);
     if cleaned.is_empty() {
         return LlmInjection::Empty;
     }
-    if is_terminal && llm::contains_line_break(&cleaned) {
+    if is_terminal && !clipboard_only && llm::contains_line_break(&cleaned) {
         return LlmInjection::RefusedMultiLine(cleaned);
     }
     LlmInjection::Inject(cleaned)
@@ -636,32 +655,45 @@ mod tests {
     const TERMINAL: bool = true;
     const NOT_A_TERMINAL: bool = false;
 
+    /// `[input] clipboard_only`: the reply is copied, never typed or pasted.
+    const CLIPBOARD_ONLY: bool = true;
+    /// The default: the reply is typed (or pasted) into the focused window.
+    const INJECTING: bool = false;
+
     /// The reported defect, end to end: the model wraps a one-line command in
-    /// a fence, and it is unwrapped and injected at either target.
+    /// a fence, and it is unwrapped and injected at either target, in either
+    /// mode.
     #[test]
     fn a_fenced_one_liner_is_unwrapped_and_injected_anywhere() {
         for target in [TERMINAL, NOT_A_TERMINAL] {
-            assert_eq!(
-                prepare_llm_injection("```bash\nsudo pacman -S steam\n```", target),
-                LlmInjection::Inject("sudo pacman -S steam".to_string()),
-                "is_terminal = {target}"
-            );
+            for mode in [INJECTING, CLIPBOARD_ONLY] {
+                assert_eq!(
+                    prepare_llm_injection("```bash\nsudo pacman -S steam\n```", target, mode),
+                    LlmInjection::Inject("sudo pacman -S steam".to_string()),
+                    "is_terminal = {target}, clipboard_only = {mode}"
+                );
+            }
         }
     }
 
-    /// Cleaning does not depend on the target: padding and a wrapping fence go
-    /// in both directions. Only the multi-line verdict is conditional.
+    /// Cleaning does not depend on the target or on `clipboard_only`: padding
+    /// and a wrapping fence go in every case. Only the multi-line verdict is
+    /// conditional.
     #[test]
     fn cleaning_is_unconditional() {
         for target in [TERMINAL, NOT_A_TERMINAL] {
-            assert_eq!(
-                prepare_llm_injection("  \n  Wo ist der Bahnhof?  \n", target),
-                LlmInjection::Inject("Wo ist der Bahnhof?".to_string())
-            );
-            assert_eq!(
-                prepare_llm_injection("```\nsudo pacman -S steam\n```\n", target),
-                LlmInjection::Inject("sudo pacman -S steam".to_string())
-            );
+            for mode in [INJECTING, CLIPBOARD_ONLY] {
+                assert_eq!(
+                    prepare_llm_injection("  \n  Wo ist der Bahnhof?  \n", target, mode),
+                    LlmInjection::Inject("Wo ist der Bahnhof?".to_string()),
+                    "is_terminal = {target}, clipboard_only = {mode}"
+                );
+                assert_eq!(
+                    prepare_llm_injection("```\nsudo pacman -S steam\n```\n", target, mode),
+                    LlmInjection::Inject("sudo pacman -S steam".to_string()),
+                    "is_terminal = {target}, clipboard_only = {mode}"
+                );
+            }
         }
     }
 
@@ -671,10 +703,31 @@ mod tests {
     #[test]
     fn multi_line_output_is_refused_at_a_terminal() {
         assert_eq!(
-            prepare_llm_injection("```sh\ncd /tmp\nrm -rf x\n```", TERMINAL),
+            prepare_llm_injection("```sh\ncd /tmp\nrm -rf x\n```", TERMINAL, INJECTING),
             LlmInjection::RefusedMultiLine("cd /tmp\nrm -rf x".to_string()),
             "the refusal must carry the cleaned text, not drop it"
         );
+    }
+
+    /// #121: `[input] clipboard_only` sends no keystroke at all, so a line
+    /// break has nothing to submit and refusing would only keep the reply out
+    /// of the clipboard the user asked for. Not refused, at a terminal or
+    /// anywhere else, and still cleaned: the fence goes and CRLF becomes `\n`
+    /// before the text is copied.
+    #[test]
+    fn multi_line_output_is_not_refused_under_clipboard_only() {
+        for target in [TERMINAL, NOT_A_TERMINAL] {
+            assert_eq!(
+                prepare_llm_injection("```sh\ncd /tmp\nrm -rf x\n```", target, CLIPBOARD_ONLY),
+                LlmInjection::Inject("cd /tmp\nrm -rf x".to_string()),
+                "a fenced multi-line reply is unwrapped, not refused: is_terminal = {target}"
+            );
+            assert_eq!(
+                prepare_llm_injection("echo one\r\necho two", target, CLIPBOARD_ONLY),
+                LlmInjection::Inject("echo one\necho two".to_string()),
+                "a CRLF reply is normalized, not refused: is_terminal = {target}"
+            );
+        }
     }
 
     /// The correction that makes the gate shareable: refusing *all* multi-line
@@ -685,11 +738,15 @@ mod tests {
     fn multi_line_output_is_injected_when_the_target_is_not_a_terminal() {
         let email = "Hi Sam,\n\nThe kitchen tap is leaking.\n\nThanks,\nAlex";
         assert_eq!(
-            prepare_llm_injection(email, NOT_A_TERMINAL),
+            prepare_llm_injection(email, NOT_A_TERMINAL, INJECTING),
             LlmInjection::Inject(email.to_string())
         );
         assert_eq!(
-            prepare_llm_injection("```python\ndef f():\n    return 1\n```", NOT_A_TERMINAL),
+            prepare_llm_injection(
+                "```python\ndef f():\n    return 1\n```",
+                NOT_A_TERMINAL,
+                INJECTING
+            ),
             LlmInjection::Inject("def f():\n    return 1".to_string()),
             "the fence still goes; only the refusal is terminal-only"
         );
@@ -701,16 +758,16 @@ mod tests {
     #[test]
     fn carriage_returns_are_normalized_before_the_verdict() {
         assert_eq!(
-            prepare_llm_injection("echo one\r\necho two", TERMINAL),
+            prepare_llm_injection("echo one\r\necho two", TERMINAL, INJECTING),
             LlmInjection::RefusedMultiLine("echo one\necho two".to_string())
         );
         assert_eq!(
-            prepare_llm_injection("echo one\recho two", TERMINAL),
+            prepare_llm_injection("echo one\recho two", TERMINAL, INJECTING),
             LlmInjection::RefusedMultiLine("echo one\necho two".to_string())
         );
         // A trailing CRLF is padding on a single-line answer, not a second line.
         assert_eq!(
-            prepare_llm_injection("sudo pacman -S steam\r\n", TERMINAL),
+            prepare_llm_injection("sudo pacman -S steam\r\n", TERMINAL, INJECTING),
             LlmInjection::Inject("sudo pacman -S steam".to_string())
         );
     }
@@ -721,7 +778,7 @@ mod tests {
     #[test]
     fn a_fence_line_carrying_content_is_refused_not_truncated() {
         let LlmInjection::RefusedMultiLine(text) =
-            prepare_llm_injection("```bash echo hi\nrm -rf /tmp/x\n```", TERMINAL)
+            prepare_llm_injection("```bash echo hi\nrm -rf /tmp/x\n```", TERMINAL, INJECTING)
         else {
             panic!("a reply with content on the fence line is multi-line");
         };
@@ -732,16 +789,20 @@ mod tests {
     }
 
     /// Nothing usable came back. Reported as its own outcome so the caller
-    /// toasts instead of injecting nothing and logging an empty entry.
+    /// toasts instead of injecting nothing and logging an empty entry. Also
+    /// under `clipboard_only`, where the alternative is copying an empty
+    /// string over whatever the user had in the clipboard.
     #[test]
     fn an_unusable_reply_is_reported_as_empty() {
         for reply in ["", "   ", "\n\t\n", "\r\n", "```\n```", "```bash\n\n```"] {
             for target in [TERMINAL, NOT_A_TERMINAL] {
-                assert_eq!(
-                    prepare_llm_injection(reply, target),
-                    LlmInjection::Empty,
-                    "{reply:?} at is_terminal = {target}"
-                );
+                for mode in [INJECTING, CLIPBOARD_ONLY] {
+                    assert_eq!(
+                        prepare_llm_injection(reply, target, mode),
+                        LlmInjection::Empty,
+                        "{reply:?} at is_terminal = {target}, clipboard_only = {mode}"
+                    );
+                }
             }
         }
     }
