@@ -36,6 +36,27 @@ Verify your mic is recognized: `arecord -l`. If nothing shows up, make sure ALSA
 
 Double-check your key is valid and not expired. Ensure the correct environment variable is set (`WHISRS_GROQ_API_KEY`, `WHISRS_DEEPGRAM_API_KEY`, or `WHISRS_OPENAI_API_KEY`), or that the key in `~/.config/whisrs/config.toml` is correct. Re-run `whisrs setup` to reconfigure.
 
+## Config file fails to load
+
+The daemon starts anyway, on built-in defaults, so the first sign is usually dictation working with none of your settings. It logs `Failed to parse config at ~/.config/whisrs/config.toml: ...`, names the line and column of the offending value, says it is using defaults, and sends a desktop notification with the same text.
+
+The CLI does not fall back silently:
+
+- `whisrs config` refuses and exits non-zero, printing that same parse error. Nothing is written, so the file is left exactly as it is.
+- `whisrs setup` reports what it found and starts a fresh config. When the new file is written, the old one is saved beside it as `config.toml.bak` at mode 0600, so an `api_key` that exists only in the broken file is still recoverable.
+
+So either fix the reported line by hand and restart the daemon, or let `whisrs setup` regenerate the file and copy what you need out of the `.bak`.
+
+## whisrs cannot read the config at all
+
+Permissions and ownership are a separate case. The error says `cannot read config at ...` instead of `cannot parse config at ...`, and both `whisrs config` and `whisrs setup` refuse before doing anything: writing the config reads it first, so no command can repair this for you. The usual cause is a config written by `sudo whisrs setup`, which leaves the file owned by root:
+
+```bash
+ls -l ~/.config/whisrs/config.toml
+sudo chown $USER ~/.config/whisrs/config.toml
+chmod 600 ~/.config/whisrs/config.toml
+```
+
 ## Text goes to the wrong window
 
 whisrs captures the focused window when recording starts and restores focus before typing. This requires compositor support. See the [Supported Environments](../README.md#supported-environments) table. On GNOME Wayland, the `window-calls` extension is required.

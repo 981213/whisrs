@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::hotkey;
@@ -756,14 +757,55 @@ struct UnknownKeyScan {
     paths: Vec<Vec<Seg>>,
 }
 
+/// Why a config file has no unknown-key scan, and so no [`PreservedKeys`] set
+/// describing it.
+///
+/// Every variant means the same thing to a caller about to rewrite the file:
+/// there is no preserve set for these bytes, so merging the reserialized struct
+/// into them would delete every key the schema does not carry — issue #134. The
+/// `Display` text completes the sentence "existing config at `<path>` …", which
+/// is how `write_config_to` reports the divert.
+#[derive(Debug)]
+pub(crate) enum UndescribableConfig {
+    /// Not valid TOML at all.
+    Unparseable(toml::de::Error),
+    /// Valid TOML that does not deserialize into [`Config`]: a type error, or an
+    /// alias section beside the canonical one (`duplicate field`).
+    NotAConfig(toml::de::Error),
+    /// A [`Config`] that does not survive `toml::Value::try_from`, so there is
+    /// nothing to diff the document against. Unreachable today — every field is
+    /// `#[serde(default)]` and the `Option` sections serialize as omitted — and
+    /// named rather than folded into the others so that if a field ever does
+    /// stop reserializing, the divert is the documented outcome instead of a
+    /// silent merge against an empty preserve set.
+    Unserializable(toml::ser::Error),
+}
+
+impl fmt::Display for UndescribableConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // Same wording as `write_config_to`'s own `DocumentMut` parse arm,
+            // which rejects an unparseable file before this is ever consulted.
+            Self::Unparseable(e) => write!(f, "is not valid TOML ({e})"),
+            Self::NotAConfig(e) => write!(f, "does not deserialize into a whisrs config ({e})"),
+            Self::Unserializable(e) => {
+                write!(f, "does not round-trip through the config schema ({e})")
+            }
+        }
+    }
+}
+
 /// Run the diff prefilter and the pruning confirmation over `contents`.
 ///
-/// Returns `None` in exactly the cases [`unknown_config_keys`] reports nothing
-/// for: not valid TOML, or valid TOML that does not deserialize.
-fn scan_unknown_keys(contents: &str) -> Option<UnknownKeyScan> {
-    let document = contents.parse::<toml::Table>().ok()?;
-    let config = toml::from_str::<Config>(contents).ok()?;
-    let known = toml::Value::try_from(&config).ok()?;
+/// Fails in exactly the cases [`unknown_config_keys`] reports nothing for: not
+/// valid TOML, valid TOML that does not deserialize, or a `Config` that does not
+/// reserialize.
+fn scan_unknown_keys(contents: &str) -> Result<UnknownKeyScan, UndescribableConfig> {
+    let document = contents
+        .parse::<toml::Table>()
+        .map_err(UndescribableConfig::Unparseable)?;
+    let config = toml::from_str::<Config>(contents).map_err(UndescribableConfig::NotAConfig)?;
+    let known = toml::Value::try_from(&config).map_err(UndescribableConfig::Unserializable)?;
     let mut candidates = Vec::new();
     diff_config_tables(
         &document,
@@ -777,7 +819,7 @@ fn scan_unknown_keys(contents: &str) -> Option<UnknownKeyScan> {
         .into_iter()
         .filter(|path| key_is_ignored(&document, &known, path))
         .collect();
-    Some(UnknownKeyScan {
+    Ok(UnknownKeyScan {
         document,
         known,
         paths,
@@ -855,16 +897,20 @@ impl PreservedKeys {
     pub(crate) const EMPTY: &'static PreservedKeys = &EMPTY_PRESERVED;
 
     /// Collect the confirmed-unknown keys of a config file.
-    pub(crate) fn from_config_str(contents: &str) -> Self {
-        let Some(scan) = scan_unknown_keys(contents) else {
-            return Self::default();
-        };
+    ///
+    /// Fails rather than returning an empty set when the file cannot be
+    /// described at all, so a caller that is about to merge into those bytes
+    /// cannot mistake "nothing to preserve" for "nothing describable here"
+    /// (issue #134). The empty set means the file was understood and has no
+    /// unknown keys; [`UndescribableConfig`] means the merge must not run.
+    pub(crate) fn from_config_str(contents: &str) -> Result<Self, UndescribableConfig> {
+        let scan = scan_unknown_keys(contents)?;
         let mut root = Self::default();
         for path in &scan.paths {
             root.insert(path);
         }
         root.record_prunable_tables(&scan.document, &scan.document, &scan.known, &[]);
-        root
+        Ok(root)
     }
 
     /// True when nothing at this level (or below it) is preserved.
@@ -2029,6 +2075,20 @@ mod tests {
         assert!(unknown.is_empty());
     }
 
+    /// The other half of that contract, and the one #116/#117 actually rest on:
+    /// a file that is valid TOML but does not deserialize reports no unknown
+    /// keys rather than warning about every key in it. `scan_unknown_keys`
+    /// returns `Err` for it since issue #134 made the failure visible to
+    /// `write_config_to`, so this pins that `unknown_config_keys` still swallows
+    /// that error into an empty list instead of propagating or panicking.
+    #[test]
+    fn valid_toml_that_is_not_a_config_reports_nothing() {
+        let unknown = unknown_config_keys(
+            "[general]\nbackend = \"groq\"\nsilence_timeout_ms = \"2000\"\nbogus = 1\n",
+        );
+        assert!(unknown.is_empty(), "{unknown:?}");
+    }
+
     #[test]
     fn non_finite_float_does_not_silence_the_report() {
         // `nan != nan`, so comparing parsed values directly would suppress every
@@ -2065,13 +2125,15 @@ mod tests {
     fn a_clean_config_preserves_nothing() {
         let preserved = PreservedKeys::from_config_str(
             "[general]\nbackend = \"groq\"\n[input]\npaste = true\n",
-        );
+        )
+        .expect("fixture is a config the preserve set can describe");
         assert!(preserved.is_empty());
     }
 
     #[test]
     fn preserved_keys_name_a_confirmed_typo() {
-        let preserved = PreservedKeys::from_config_str("[input]\npast = true\n");
+        let preserved = PreservedKeys::from_config_str("[input]\npast = true\n")
+            .expect("fixture is a config the preserve set can describe");
         assert!(preserved.table("input").contains_leaf("past"));
         assert!(!preserved.contains_leaf("input"));
     }
@@ -2081,7 +2143,8 @@ mod tests {
         // Both leaves are confirmed-unknown and pruning `[bogus]` as a whole
         // changes nothing, so the writer may keep the entire section.
         let preserved =
-            PreservedKeys::from_config_str("[bogus]\nfoo = 1\n[bogus.nested]\nbar = 2\n");
+            PreservedKeys::from_config_str("[bogus]\nfoo = 1\n[bogus.nested]\nbar = 2\n")
+                .expect("fixture is a config the preserve set can describe");
         let bogus = preserved.table("bogus");
         assert!(bogus.contains_leaf("foo"));
         assert!(bogus.table("nested").contains_leaf("bar"));
@@ -2095,7 +2158,8 @@ mod tests {
         // beside the canonical section.
         let preserved = PreservedKeys::from_config_str(
             "[general]\nbackend = \"local\"\n[local]\nmodel_path = \"/m.bin\"\nbogus = 1\n",
-        );
+        )
+        .expect("fixture is a config the preserve set can describe");
         let local = preserved.table("local");
         assert!(local.contains_leaf("bogus"));
         assert!(!local.contains_leaf("model_path"));
@@ -2119,7 +2183,8 @@ mod tests {
             // also emits: keeping both makes the file fail to deserialize
             // outright. The leaf still has to be *named* (the warning quotes
             // it); it is the whole-table flag that stops the writer keeping it.
-            let preserved = PreservedKeys::from_config_str(&contents);
+            let preserved = PreservedKeys::from_config_str(&contents)
+                .expect("fixture is a config the preserve set can describe");
             assert!(preserved.table(section).contains_leaf("bogus"));
             assert!(
                 !preserved.table(section).table_prunable(),
@@ -2133,7 +2198,8 @@ mod tests {
         // Same section, spelled as a root inline table. `toml` parses it to the
         // same `Value::Table`, so the guard must reach it too.
         let preserved =
-            PreservedKeys::from_config_str("asr = { bogus = 1 }\n[general]\nbackend = \"groq\"\n");
+            PreservedKeys::from_config_str("asr = { bogus = 1 }\n[general]\nbackend = \"groq\"\n")
+                .expect("fixture is a config the preserve set can describe");
         assert!(preserved.table("asr").contains_leaf("bogus"));
         assert!(!preserved.table("asr").table_prunable());
     }
@@ -2143,7 +2209,8 @@ mod tests {
         // The other side of the same flag: `[bogus]` is not an alias for
         // anything, so deleting it changes nothing and the writer may keep it.
         let preserved =
-            PreservedKeys::from_config_str("[bogus]\nfoo = 1\n[bogus.nested]\nbar = 2\n");
+            PreservedKeys::from_config_str("[bogus]\nfoo = 1\n[bogus.nested]\nbar = 2\n")
+                .expect("fixture is a config the preserve set can describe");
         assert!(preserved.table("bogus").table_prunable());
         assert!(
             preserved.table("bogus").table("nested").table_prunable(),
@@ -2166,7 +2233,8 @@ mod tests {
             ("tts", "bogus"),
         ] {
             let contents = format!("[general]\nbackend = \"groq\"\n[{section}]\n{key} = 1\n");
-            let preserved = PreservedKeys::from_config_str(&contents);
+            let preserved = PreservedKeys::from_config_str(&contents)
+                .expect("fixture is a config the preserve set can describe");
             assert!(
                 preserved.table(section).contains_leaf(key),
                 "`{section}.{key}` dropped from the preserve set"
@@ -2196,7 +2264,8 @@ mod tests {
                 "fixture no longer exercises the leafless-table rule ({shape})"
             );
 
-            let preserved = PreservedKeys::from_config_str(&contents);
+            let preserved = PreservedKeys::from_config_str(&contents)
+                .expect("fixture is a config the preserve set can describe");
             assert!(preserved.table("bogus").contains_leaf("important"));
             assert!(
                 preserved.table("bogus").table_prunable(),
@@ -2210,7 +2279,8 @@ mod tests {
         // Same rule, spelled as a header rather than an inline `{}`.
         let preserved = PreservedKeys::from_config_str(
             "[general]\nbackend = \"groq\"\n[bogus]\nimportant = 1\n[bogus.emptysub]\n",
-        );
+        )
+        .expect("fixture is a config the preserve set can describe");
         assert!(preserved.table("bogus").table_prunable());
     }
 
@@ -2222,7 +2292,8 @@ mod tests {
         // section the writer emits, and keeping both is a `duplicate field`
         // error, i.e. the daemon discards the user's entire config.
         let contents = "[general]\nbackend = \"groq\"\n[asr]\nbogus = 1\n[asr.empty]\n";
-        let preserved = PreservedKeys::from_config_str(contents);
+        let preserved = PreservedKeys::from_config_str(contents)
+            .expect("fixture is a config the preserve set can describe");
         assert!(preserved.table("asr").contains_leaf("bogus"));
         assert!(
             !preserved.table("asr").table_prunable(),
@@ -2319,6 +2390,7 @@ mod tests {
             );
             assert!(
                 !PreservedKeys::from_config_str(&contents)
+                    .expect("fixture is a config the preserve set can describe")
                     .table(section)
                     .table_prunable(),
                 "`[{section}]` marked prunable, so the rewrite would carry both spellings"
@@ -2332,7 +2404,8 @@ mod tests {
         // pruned the `overlay` node and took `colors` down with it.
         let preserved = PreservedKeys::from_config_str(
             "[general]\nbackend = \"groq\"\n[overlay.colors]\nbogos = 1\n",
-        );
+        )
+        .expect("fixture is a config the preserve set can describe");
         assert!(preserved
             .table("overlay")
             .table("colors")
