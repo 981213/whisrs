@@ -1247,6 +1247,142 @@ fn diff_config_tables(
     }
 }
 
+/// What a `[general] backend` name is, for the two readers of
+/// [`BACKEND_NAMES`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackendNameKind {
+    /// A backend that transcribes. These are the names the unknown-backend
+    /// error advertises as "Valid options".
+    Primary,
+    /// An accepted second spelling of a primary — `local`, `asr`,
+    /// `vibevoice`. [`Config::validate`] routes them, so every gate keyed on
+    /// the backend string has to answer for them too, but they are not
+    /// advertised: one name per backend in the error message.
+    Alias,
+    /// Parses and routes, then bails at transcription time with "not yet
+    /// implemented" (`local-vosk`, `local-parakeet`). Named in the error only
+    /// to say *not* to pick one, and never recommended by a warning — see
+    /// `assert_no_stub_backend_advice`.
+    Stub,
+}
+
+/// One `[general] backend` string [`Config::validate`] accepts.
+struct BackendName {
+    name: &'static str,
+    kind: BackendNameKind,
+}
+
+/// Every `[general] backend` string [`Config::validate`] accepts, in the order
+/// the unknown-backend error lists them.
+///
+/// One list, three readers, which is the point. `validate` rejects anything
+/// not in here *before* the per-backend match, so a name absent from this
+/// const cannot be selected at all however many match arms it grows; the
+/// unknown-backend message is built from it, so the "Valid options" list
+/// cannot drift from what is actually routed; and
+/// `config_inert_prompt_gate_agrees_with_every_sends_prompt_impl` iterates it
+/// to require a case per name, so a new backend whose `sends_prompt` is false
+/// cannot reach a user without the inert-prompt gate being taught about it.
+///
+/// That chain is the whole reason this is a const rather than three hand-kept
+/// lists. The test used to enumerate its own cases: a reviewer added a
+/// promptless `acme-realtime` to `validate` and to `create_backend`, touched
+/// neither the gate nor the test, and all 663 tests stayed green.
+const BACKEND_NAMES: &[BackendName] = &[
+    BackendName {
+        name: "deepgram",
+        kind: BackendNameKind::Primary,
+    },
+    BackendName {
+        name: "deepgram-streaming",
+        kind: BackendNameKind::Primary,
+    },
+    BackendName {
+        name: "groq",
+        kind: BackendNameKind::Primary,
+    },
+    BackendName {
+        name: "openai",
+        kind: BackendNameKind::Primary,
+    },
+    BackendName {
+        name: "openai-realtime",
+        kind: BackendNameKind::Primary,
+    },
+    BackendName {
+        name: "openai-compatible-realtime",
+        kind: BackendNameKind::Primary,
+    },
+    BackendName {
+        name: "local-whisper",
+        kind: BackendNameKind::Primary,
+    },
+    BackendName {
+        name: "asr-sidecar",
+        kind: BackendNameKind::Primary,
+    },
+    BackendName {
+        name: "local",
+        kind: BackendNameKind::Alias,
+    },
+    BackendName {
+        name: "asr",
+        kind: BackendNameKind::Alias,
+    },
+    BackendName {
+        name: "vibevoice",
+        kind: BackendNameKind::Alias,
+    },
+    BackendName {
+        name: "local-vosk",
+        kind: BackendNameKind::Stub,
+    },
+    BackendName {
+        name: "local-parakeet",
+        kind: BackendNameKind::Stub,
+    },
+];
+
+/// The names of every [`BACKEND_NAMES`] entry of one kind, in order.
+fn backend_names_of(kind: BackendNameKind) -> Vec<&'static str> {
+    BACKEND_NAMES
+        .iter()
+        .filter(|b| b.kind == kind)
+        .map(|b| b.name)
+        .collect()
+}
+
+/// What `[general] vocabulary` actually reaches on Deepgram, given the
+/// `[deepgram] model` in this config and the terms in the list.
+///
+/// Deepgram is the one backend with a second hint channel — the vocabulary
+/// rides as `keyterm` query params instead of in a prompt — which makes it the
+/// one backend the other warnings in this file can send a user to. Both ways
+/// that channel can be dead are in the user's own config rather than in
+/// Deepgram: a pre-Nova-3 model rejects the parameter outright, and the
+/// keyterm limits can drop every term of a list on a model that does take it.
+/// A recommendation that ignores either one names a way out that does not
+/// work, which is the one thing a warning here may never do.
+///
+/// Resolved by [`Config::deepgram_hint_channel`], read twice by
+/// [`Config::inert_prompt_warnings`]: once to pick the Deepgram prompt
+/// message, once to decide whether the Lemonade vocabulary message may offer
+/// deepgram at all.
+enum DeepgramHintChannel {
+    /// The model takes `keyterm` and the configured terms reach the wire — or
+    /// there are no terms yet, so terms added now would. Pointing a user here
+    /// is real advice.
+    Live,
+    /// The model takes `keyterm`, but every configured term is dropped by the
+    /// keyterm limits, so the channel carries nothing as configured. Carries
+    /// the usable count, which is the number
+    /// [`Config::deepgram_keyterm_warnings`] reports as "0 of N".
+    NothingFits { usable: usize },
+    /// The model rejects `keyterm` outright: it is a Nova-3/Flux feature and
+    /// Deepgram answers 400 on anything older.
+    Unsupported,
+}
+
 impl Config {
     /// Validate the configuration and return a list of warnings.
     ///
@@ -1255,6 +1391,23 @@ impl Config {
     pub fn validate(&self) -> Result<Vec<ConfigWarning>, WhisrsError> {
         let mut warnings = Vec::new();
         let backend = self.general.backend.as_str();
+
+        // Routability is decided here, off [`BACKEND_NAMES`], and not by the
+        // arms below. A backend that grows a match arm without an entry in
+        // that const is rejected as unknown, which is what makes the const the
+        // single place a new backend has to be registered — and therefore what
+        // makes the inert-prompt gate test, which iterates the same const, an
+        // actual totality check rather than a hand-kept list that agrees with
+        // another hand-kept list.
+        if !BACKEND_NAMES.iter().any(|b| b.name == backend) {
+            return Err(WhisrsError::Config(format!(
+                "Unknown backend '{backend}'. Valid options: {}. ({} are also \
+                 accepted here but are not implemented yet — they fail at \
+                 transcription time, so do not pick one to get out of this error.)",
+                backend_names_of(BackendNameKind::Primary).join(", "),
+                backend_names_of(BackendNameKind::Stub).join(" and ")
+            )));
+        }
 
         match backend {
             "deepgram" | "deepgram-streaming" => {
@@ -1424,15 +1577,12 @@ impl Config {
                     ))
                 })?;
             }
-            other => {
-                return Err(WhisrsError::Config(format!(
-                    "Unknown backend '{other}'. Valid options: deepgram, deepgram-streaming, \
-                     groq, openai, openai-realtime, openai-compatible-realtime, \
-                     local-whisper, asr-sidecar. (local-vosk and local-parakeet are also \
-                     accepted here but are not implemented yet — they fail at transcription \
-                     time, so do not pick one to get out of this error.)"
-                )));
-            }
+            // Unreachable for an unknown name: the [`BACKEND_NAMES`] check
+            // above has already returned. A name that is in the const but has
+            // no arm here simply has no config prerequisites to check — the
+            // aliases fall through to their primary's arm above, so this is
+            // the empty case, not a silent skip of a check that exists.
+            _ => {}
         }
 
         if self.general.silence_timeout_ms == 0 {
@@ -1831,6 +1981,31 @@ impl Config {
         warnings
     }
 
+    /// Resolve [`DeepgramHintChannel`] for this config.
+    ///
+    /// Reads the same two functions the request builder does —
+    /// [`deepgram::supports_keyterm`] and [`deepgram::effective_keyterms`] —
+    /// so the answer a warning is built on is the answer the wire gets. An
+    /// empty vocabulary is [`DeepgramHintChannel::Live`] on a model that takes
+    /// keyterm: there is nothing being dropped, and terms added now would
+    /// arrive, so "use `[general] vocabulary`" is advice that works.
+    ///
+    /// Not gated on `[general] backend`, on purpose, and that is the
+    /// difference from [`Config::deepgram_keyterm_warnings`]. This answers
+    /// "would the vocabulary reach Deepgram *if* the user went there", which
+    /// is the question a warning on another backend has to ask before naming
+    /// deepgram as a destination.
+    fn deepgram_hint_channel(&self) -> DeepgramHintChannel {
+        if !deepgram::supports_keyterm(&self.deepgram_model()) {
+            return DeepgramHintChannel::Unsupported;
+        }
+        let usable = deepgram::usable_keyterms(&self.general.vocabulary).count();
+        if usable > 0 && deepgram::effective_keyterms(&self.general.vocabulary).is_empty() {
+            return DeepgramHintChannel::NothingFits { usable };
+        }
+        DeepgramHintChannel::Live
+    }
+
     /// Load-time warnings about `[general] prompt` and `[general] vocabulary`
     /// being discarded by a backend that puts no prompt on the wire (#140).
     ///
@@ -1857,16 +2032,31 @@ impl Config {
     /// free-form `prompt` is inert there. Warning about vocabulary on Deepgram
     /// would push people off the one hint that works, and would contradict
     /// [`Config::deepgram_keyterm_warnings`], which reports the real reasons a
-    /// keyterm gets dropped — including the one this function has to route
-    /// around: on a pre-Nova-3 `[deepgram] model` that second channel is dead
-    /// too, so the prompt warning must not send the user to `[general]
-    /// vocabulary` that the warning right above it has just called dropped.
-    /// It points at the nova-3 switch that revives the channel instead.
+    /// keyterm gets dropped — both of which this function has to route around,
+    /// because that warning has two ways to say the vocabulary is not
+    /// arriving. On a pre-Nova-3 `[deepgram] model` the second channel is dead
+    /// for every term; on a model that does take keyterm, the keyterm limits
+    /// can still drop every term in the list. Either way the prompt warning
+    /// must not send the user to a `[general] vocabulary` the warning right
+    /// above it has just called dropped, so the destination comes off
+    /// [`Config::deepgram_hint_channel`]: the model switch when keyterm is
+    /// unsupported, trimming the list when nothing fits, and the vocabulary
+    /// itself only when it would actually carry terms.
     ///
     /// `local-vosk` and `local-parakeet` answer `false` as well, but their
     /// `transcribe()` bails with "not yet implemented" — nothing is discarded
     /// because nothing is transcribed. They get no warning, and like every
     /// other recommendation in this file they are never named as a way out.
+    ///
+    /// Neither is `local-whisper`, which is why the "switch to" lists here
+    /// stop at groq, openai and asr-sidecar. It is a real backend and it does
+    /// send the prompt, but the `whisrs-linux-{x86_64,aarch64}-minimal`
+    /// release artifacts are built `--no-default-features --features
+    /// tray,overlay,hooks`, and in those binaries the stub that stands in for
+    /// it bails with "local-whisper feature not enabled". Half the artifacts
+    /// this project ships cannot act on that advice, and a warning cannot tell
+    /// which binary it is running in. The test helper
+    /// `assert_no_stub_backend_advice` holds the line.
     fn inert_prompt_warnings(&self, backend: &str) -> Vec<ConfigWarning> {
         /// Which promptless backend the two messages below are describing.
         ///
@@ -1885,9 +2075,13 @@ impl Config {
             /// `deepgram` / `deepgram-streaming`: neither the REST nor the
             /// WebSocket API has a prompt field, but the vocabulary has a
             /// second channel — the `keyterm` query params — so only the
-            /// prompt is inert. Carries the resolved `[deepgram] model`
-            /// because that channel is itself gated on the model.
-            Deepgram { model: String },
+            /// prompt is inert. Carries the resolved `[deepgram] model` and
+            /// the state of that channel, because whether it is worth pointing
+            /// at depends on both the model and the terms.
+            Deepgram {
+                model: String,
+                channel: DeepgramHintChannel,
+            },
             /// `openai-compatible-realtime`: `LemonadeSessionUpdate::new`
             /// takes no prompt argument at all, so both keys are inert.
             Lemonade,
@@ -1906,6 +2100,7 @@ impl Config {
         let case = match backend {
             "deepgram" | "deepgram-streaming" => InertPromptCase::Deepgram {
                 model: self.deepgram_model(),
+                channel: self.deepgram_hint_channel(),
             },
             "openai-compatible-realtime" => InertPromptCase::Lemonade,
             "openai-realtime" => {
@@ -1952,10 +2147,14 @@ impl Config {
         if has_prompt {
             warnings.push(ConfigWarning {
                 message: match &case {
-                    // Deepgram on a model that takes keyterm: the prompt is
-                    // gone, but the vocabulary channel is live, so send them
-                    // there.
-                    InertPromptCase::Deepgram { model } if deepgram::supports_keyterm(model) => {
+                    // Deepgram with a live keyterm channel: the prompt is gone,
+                    // but the vocabulary really does arrive, so send them
+                    // there. Live includes "no vocabulary set yet" — nothing
+                    // is being dropped, and terms added now would arrive.
+                    InertPromptCase::Deepgram {
+                        channel: DeepgramHintChannel::Live,
+                        ..
+                    } => {
                         format!(
                             "[general] prompt is ignored with backend = \"{backend}\": the \
                              Deepgram API has no prompt field, so the hint is dropped before the \
@@ -1964,13 +2163,37 @@ impl Config {
                              and does bias transcription."
                         )
                     }
+                    // Deepgram on a model that takes keyterm, with a
+                    // vocabulary the keyterm limits drop whole:
+                    // `deepgram_keyterm_warnings` has just reported "0 of N
+                    // usable term(s) reach Deepgram", so "use [general]
+                    // vocabulary, it does bias transcription" would recommend
+                    // a channel that is delivering nothing. The channel is not
+                    // dead, though — trimming the list is what revives it, and
+                    // that is a different way out from the model switch below.
+                    InertPromptCase::Deepgram {
+                        model,
+                        channel: DeepgramHintChannel::NothingFits { usable },
+                    } => format!(
+                        "[general] prompt is ignored with backend = \"{backend}\": the Deepgram \
+                         API has no prompt field, so the hint is dropped before the request is \
+                         built and nothing reaches the model. Deepgram's own hint channel is the \
+                         keyterm query param, which [deepgram] model = \"{model}\" does take — \
+                         but none of the {usable} term(s) in [general] vocabulary fit the keyterm \
+                         limits, so that channel is carrying nothing either, as the [general] \
+                         vocabulary warning alongside this one says. Trim [general] vocabulary \
+                         until at least one term fits to get a hint channel back."
+                    ),
                     // Deepgram on a pre-Nova-3 model: the vocabulary channel
-                    // is dead too, and `deepgram_keyterm_warnings` has already
-                    // said so in the line right above this one. Recommending
-                    // `[general] vocabulary` here would recommend exactly what
-                    // that warning just called dropped, so point at the model
-                    // switch that revives it instead.
-                    InertPromptCase::Deepgram { model } => format!(
+                    // is dead for every term, and `deepgram_keyterm_warnings`
+                    // has already said so in the line right above this one.
+                    // Recommending `[general] vocabulary` here would recommend
+                    // exactly what that warning just called dropped, so point
+                    // at the model switch that revives it instead.
+                    InertPromptCase::Deepgram {
+                        model,
+                        channel: DeepgramHintChannel::Unsupported,
+                    } => format!(
                         "[general] prompt is ignored with backend = \"{backend}\": the Deepgram \
                          API has no prompt field, so the hint is dropped before the request is \
                          built and nothing reaches the model. Deepgram's own hint channel is the \
@@ -1982,15 +2205,15 @@ impl Config {
                     InertPromptCase::Lemonade => format!(
                         "[general] prompt is ignored with backend = \"{backend}\": the Lemonade \
                          session.update carries no prompt field, so the hint never reaches the \
-                         wire. Switch to a backend that sends it (groq, openai, asr-sidecar, \
-                         local-whisper) to use a prompt."
+                         wire. Switch to a backend that sends it (groq, openai, asr-sidecar) to \
+                         use a prompt."
                     ),
                     InertPromptCase::OpenAiRealtimeManualCommit { model } => format!(
                         "[general] prompt is ignored with backend = \"{backend}\" on [openai] \
                          model = \"{model}\": manual-commit models get prompt = None in the \
                          session.update, so the hint never reaches the wire. Switch to a \
                          server-VAD model such as gpt-4o-transcribe to send it, or to a backend \
-                         that always does (groq, openai, asr-sidecar, local-whisper)."
+                         that always does (groq, openai, asr-sidecar)."
                     ),
                 },
             });
@@ -2006,20 +2229,41 @@ impl Config {
                 // [`Config::deepgram_keyterm_warnings`] is the one that says
                 // so, with the model named.
                 InertPromptCase::Deepgram { .. } => None,
-                InertPromptCase::Lemonade => Some(format!(
-                    "[general] vocabulary is ignored with backend = \"{backend}\": the {terms} \
-                     term(s) are folded into the transcription prompt, and the Lemonade \
-                     session.update carries no prompt field, so they reach nothing. Switch to a \
-                     backend that sends the prompt (groq, openai, asr-sidecar, local-whisper), \
-                     or to deepgram, which sends vocabulary as keyterm query params."
-                )),
+                InertPromptCase::Lemonade => {
+                    // "or to deepgram" is a way out only if the vocabulary
+                    // would ride the keyterm channel once the user got there,
+                    // and that is decided by the `[deepgram] model` already in
+                    // this config — routinely a stale one, because `whisrs
+                    // setup` writes a `[deepgram]` section and people leave it
+                    // behind when they switch backends. That staleness is the
+                    // exact scenario `deepgram_keyterm_warnings` is gated on
+                    // the active backend for, so nothing else is watching:
+                    // follow this clause with a leftover `model = "nova-2"`,
+                    // or with a vocabulary the keyterm limits drop whole, and
+                    // the terms are dropped again at the destination with no
+                    // warning saying why.
+                    let deepgram_clause = match self.deepgram_hint_channel() {
+                        DeepgramHintChannel::Live => {
+                            ", or to deepgram, which sends vocabulary as keyterm query params"
+                        }
+                        DeepgramHintChannel::NothingFits { .. }
+                        | DeepgramHintChannel::Unsupported => "",
+                    };
+                    Some(format!(
+                        "[general] vocabulary is ignored with backend = \"{backend}\": the \
+                         {terms} term(s) are folded into the transcription prompt, and the \
+                         Lemonade session.update carries no prompt field, so they reach nothing. \
+                         Switch to a backend that sends the prompt (groq, openai, \
+                         asr-sidecar){deepgram_clause}."
+                    ))
+                }
                 InertPromptCase::OpenAiRealtimeManualCommit { model } => Some(format!(
                     "[general] vocabulary is ignored with backend = \"{backend}\" on [openai] \
                      model = \"{model}\": the {terms} term(s) are folded into the transcription \
                      prompt, and manual-commit models get prompt = None in the session.update, \
                      so they reach nothing. Switch to a server-VAD model such as \
                      gpt-4o-transcribe, or to a backend that always sends the prompt (groq, \
-                     openai, asr-sidecar, local-whisper)."
+                     openai, asr-sidecar)."
                 )),
             };
             if let Some(message) = message {
@@ -3132,16 +3376,76 @@ mod tests {
         );
     }
 
+    /// The sentences of `message` that tell the user where to go.
+    ///
+    /// Every recommendation in this file opens with an imperative verb, and
+    /// the set is small enough to enumerate: "Switch ...", "Use ...", "Trim
+    /// ...". The split exists because a backend name in a warning means two
+    /// different things — `[input] paste` and `[general] llm_post_process`
+    /// both *describe* local-whisper as one of the streaming backends that
+    /// ignore the key, in the same message whose closing sentence recommends
+    /// something else entirely — and only the recommending half is what
+    /// [`assert_no_stub_backend_advice`] may police.
+    ///
+    /// A new recommendation opening with a verb not listed here does not slip
+    /// through silently: the caller asserts it found at least one sentence, so
+    /// the omission fails the test that guards the message.
+    fn recommendation_sentences(message: &str) -> Vec<&str> {
+        message
+            .split_terminator('.')
+            .map(str::trim)
+            .filter(|sentence| {
+                ["Switch", "Use ", "Trim"]
+                    .iter()
+                    .any(|verb| sentence.starts_with(verb))
+            })
+            .collect()
+    }
+
     /// `local-vosk` and `local-parakeet` parse as valid config but their
     /// `transcribe()` bails with "not yet implemented", so a warning that
     /// tells the user to switch to one trades a no-op setting for dictation
     /// that does not work at all. No warning may recommend them.
+    ///
+    /// `local-whisper` is the third name no warning may send the user to, for
+    /// a different reason. It is a real backend in the default build, but the
+    /// `whisrs-linux-{x86_64,aarch64}-minimal` release artifacts are built
+    /// `--no-default-features --features tray,overlay,hooks` (see
+    /// `.github/workflows/release.yml`), and in those binaries the stub that
+    /// stands in for it bails with "local-whisper feature not enabled". Half
+    /// the artifacts this project ships cannot act on the advice, and the
+    /// warning has no way to tell which binary it is running in. `origin/main`
+    /// never named it as a destination; the #140 warnings were the first to,
+    /// which is what this check stops coming back.
+    ///
+    /// Checked per recommendation sentence rather than over the whole message,
+    /// because unlike the two stubs, local-whisper is legitimately *described*
+    /// by two of the warnings this helper guards.
     fn assert_no_stub_backend_advice(message: &str) {
         for stub in ["local-vosk", "local-parakeet"] {
             assert!(
                 !message.contains(stub),
                 "{stub} is an unimplemented stub — recommending it breaks dictation \
                  outright: {message}"
+            );
+        }
+
+        let recommendations = recommendation_sentences(message);
+        assert!(
+            !recommendations.is_empty(),
+            "every warning guarded by this helper has to end somewhere the user can go, and \
+             this one has no sentence opening with a verb recommendation_sentences knows. \
+             Either the message lost its way out, or it found a new way to phrase one and \
+             that verb has to be added there — leaving it unlisted would make this check \
+             silently stop applying: {message}"
+        );
+        for sentence in recommendations {
+            assert!(
+                !sentence.contains("local-whisper"),
+                "local-whisper is inert in the minimal release artifacts, which ship with \
+                 --no-default-features: recommending it hands half the users a backend that \
+                 bails with \"local-whisper feature not enabled\". Name groq, openai or \
+                 asr-sidecar instead: {sentence}"
             );
         }
     }
@@ -4404,18 +4708,20 @@ mod tests {
     /// sentence deleted, because the diagnosis half still names a backend.
     fn assert_prompt_warning_offers_a_way_out(config: &Config, backend: &str, message: &str) {
         let required: &[&str] = match backend {
-            "deepgram" | "deepgram-streaming" => {
-                if deepgram::supports_keyterm(&config.deepgram_model()) {
-                    // The second channel is live on this model, so it is the
-                    // way out.
-                    &["[general] vocabulary", "keyterm query params"]
-                } else {
-                    // It is dead on this model, and `deepgram_keyterm_warnings`
-                    // says so in the same breath. Only the model switch
-                    // revives it, so that has to be what this names.
-                    &["Switch [deepgram] model to a nova-3 model"]
-                }
-            }
+            "deepgram" | "deepgram-streaming" => match config.deepgram_hint_channel() {
+                // The second channel is live, so it is the way out.
+                DeepgramHintChannel::Live => &["[general] vocabulary", "keyterm query params"],
+                // The model takes keyterm but every term is dropped by the
+                // limits, and `deepgram_keyterm_warnings` has said "0 of N" in
+                // the same breath. The channel is revived by trimming, not by
+                // being pointed at as it stands.
+                DeepgramHintChannel::NothingFits { .. } => &["Trim [general] vocabulary"],
+                // The channel is dead on this model, and
+                // `deepgram_keyterm_warnings` says so in the same breath. Only
+                // the model switch revives it, so that has to be what this
+                // names.
+                DeepgramHintChannel::Unsupported => &["Switch [deepgram] model to a nova-3 model"],
+            },
             // No hint channel at all: another model on the same backend, or
             // another backend entirely.
             "openai-realtime" => &["gpt-4o-transcribe", "groq"],
@@ -4524,6 +4830,146 @@ mod tests {
                  back: {prompt}"
             );
         }
+    }
+
+    /// One term nothing can make fit: past the query budget on its own, so
+    /// `effective_keyterms` drops it whatever else is in the list. Sized off
+    /// the constant rather than the 5000 characters the report used, so it
+    /// cannot quietly start fitting if the budget is raised.
+    fn unfittable_keyterm() -> String {
+        "x".repeat(deepgram::KEYTERM_QUERY_BUDGET_BYTES + 1)
+    }
+
+    #[test]
+    fn config_inert_prompt_on_deepgram_with_no_keyterm_room_points_at_trimming() {
+        // The *other* way `deepgram_keyterm_warnings` reports the vocabulary
+        // as dropped, and the one a split on `supports_keyterm` alone misses:
+        // nova-3 does take keyterm, so the model test passes, but a term past
+        // the query budget leaves `effective_keyterms` empty and zero terms go
+        // on the wire. "Use [general] vocabulary instead ... it does bias
+        // transcription" would then recommend a channel delivering nothing, in
+        // the line right after the one saying 0 of 1 reach Deepgram — the same
+        // contradiction the nova-2 arm was split out to stop.
+        for backend in ["deepgram", "deepgram-streaming"] {
+            let mut config = inert_prompt_config(backend);
+            // `validatable_config` pins the default nova-3, so the keyterm
+            // channel is supported here and only the terms are the problem.
+            config.general.vocabulary = vec![unfittable_keyterm()];
+            assert!(
+                deepgram::supports_keyterm(&config.deepgram_model()),
+                "this case is about a model that does take keyterm; a pre-Nova-3 one is the \
+                 test above"
+            );
+
+            let warnings = config.validate().unwrap();
+            let keyterm = warnings
+                .iter()
+                .find(|w| w.message.contains("usable term(s) reach"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "one oversized term is dropped by the keyterm limits; this test needs \
+                         both warnings present to show they agree, got: {warnings:?}"
+                    )
+                });
+            assert!(
+                keyterm.message.contains("0 of 1 usable term(s) reach"),
+                "the vocabulary has to be delivering nothing for this case to exist: {}",
+                keyterm.message
+            );
+            assert!(
+                keyterm.message.contains("Trim the list"),
+                "the keyterm warning's way out is the trim; the prompt warning has to point at \
+                 the same one: {}",
+                keyterm.message
+            );
+
+            let prompt = prompt_warning_through_validate(&config, backend);
+            assert!(
+                !prompt.contains("Use [general] vocabulary instead"),
+                "[general] vocabulary carries zero terms on this config — the warning above \
+                 says so — so the prompt warning must not recommend it as the channel that \
+                 works: {prompt}"
+            );
+            assert!(
+                !prompt.contains("does bias transcription"),
+                "nothing reaches the model through either channel here; claiming the \
+                 vocabulary biases transcription is the contradiction: {prompt}"
+            );
+            assert!(
+                prompt.contains("Trim [general] vocabulary"),
+                "trimming is what revives the channel, so that is where the warning has to \
+                 point: {prompt}"
+            );
+        }
+    }
+
+    /// Pull the "[general] vocabulary is ignored with backend" warning out of
+    /// `validate()`, with the checks every shape of it must satisfy.
+    fn vocabulary_warning_through_validate(config: &Config, backend: &str) -> String {
+        let warnings = config.validate().unwrap();
+        let warning = warnings
+            .iter()
+            .find(|w| {
+                w.message
+                    .contains("[general] vocabulary is ignored with backend")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "backend {backend} folds the vocabulary into a prompt it never sends; \
+                     expected a warning, got: {warnings:?}"
+                )
+            });
+        assert_no_stub_backend_advice(&warning.message);
+        warning.message.clone()
+    }
+
+    #[test]
+    fn config_inert_prompt_lemonade_vocabulary_offers_deepgram_only_when_keyterm_would_land() {
+        // "or to deepgram, which sends vocabulary as keyterm query params" is
+        // advice about a config the user does not have yet, so it has to be
+        // checked against the `[deepgram] model` they do have. Nothing else
+        // will: `deepgram_keyterm_warnings` is gated on the *active* backend,
+        // which is Lemonade here, so it stays silent about the stale section
+        // this clause is about to send them to.
+        let backend = "openai-compatible-realtime";
+
+        let live = inert_prompt_config(backend);
+        let message = vocabulary_warning_through_validate(&live, backend);
+        assert!(
+            message.contains("or to deepgram, which sends vocabulary as keyterm query params"),
+            "the default nova-3 takes keyterm and the terms fit, so deepgram really is a way \
+             out and the clause belongs: {message}"
+        );
+
+        // The scenario `deepgram_keyterm_warnings`' own doc comment calls
+        // routine: `whisrs setup` wrote a `[deepgram]` section, the user
+        // switched backends, and the model left behind predates keyterm.
+        // Following the clause lands them on a config where the vocabulary is
+        // dropped again, and this time nothing warns.
+        let mut stale = inert_prompt_config(backend);
+        stale.deepgram.as_mut().unwrap().model = "nova-2".to_string();
+        let message = vocabulary_warning_through_validate(&stale, backend);
+        assert!(
+            !message.contains("deepgram"),
+            "[deepgram] model = \"nova-2\" rejects keyterm, so deepgram is not a destination \
+             for this vocabulary and must not be named: {message}"
+        );
+        assert!(
+            message.contains("groq"),
+            "dropping the deepgram clause must not leave the warning without a way out: \
+             {message}"
+        );
+
+        // The other way the channel dies, the one Finding 1 is about: a model
+        // that does take keyterm, and terms the limits drop whole.
+        let mut unfittable = inert_prompt_config(backend);
+        unfittable.general.vocabulary = vec![unfittable_keyterm()];
+        let message = vocabulary_warning_through_validate(&unfittable, backend);
+        assert!(
+            !message.contains("deepgram"),
+            "every term is dropped by the keyterm limits, so switching to deepgram would \
+             deliver none of them: {message}"
+        );
     }
 
     #[test]
@@ -4699,8 +5145,26 @@ mod tests {
     /// So ask the real impls. Instantiate every backend `Config::validate`
     /// can route to, hand each one a request carrying a prompt, and require
     /// the gate to produce the prompt warning exactly when `sends_prompt` is
-    /// false. Adding a backend that drops the prompt and forgetting the gate
-    /// fails here.
+    /// false.
+    ///
+    /// What makes that "every" rather than "the ones someone remembered": the
+    /// case list is checked against `BACKEND_NAMES` at the end, and `validate`
+    /// rejects any `[general] backend` outside that const before it reaches a
+    /// match arm. So a new backend cannot be selectable without an entry in
+    /// the const, and cannot have an entry in the const without a case here.
+    /// The previous version of this comment claimed the same thing without
+    /// that chain: `cases` was hand-written and derived from nothing, and a
+    /// reviewer who added a promptless "acme-realtime" to `validate` and to
+    /// `create_backend` — touching neither the gate nor this test — watched
+    /// all 663 tests stay green.
+    ///
+    /// Two limits, stated rather than implied. The daemon's `create_backend`
+    /// lives in a separate binary crate and cannot be called from here, so
+    /// what is proved is agreement for every name `validate` routes; a backend
+    /// wired into the factory and nowhere else is not covered, but it is also
+    /// not reachable, because `validate` rejects its name first. And the two
+    /// local-whisper names are skipped when the feature is off, where the real
+    /// impl is not compiled in at all — the default-feature run covers them.
     #[test]
     fn config_inert_prompt_gate_agrees_with_every_sends_prompt_impl() {
         use crate::transcription::asr_sidecar::AsrSidecarBackend;
@@ -4793,6 +5257,30 @@ mod tests {
                     crate::transcription::local_whisper::LocalWhisperBackend::new(String::new()),
                 ),
             });
+        }
+
+        // The half that makes this total. Every name a user can select is in
+        // `BACKEND_NAMES` — `validate()` rejects the rest before the match —
+        // so requiring a case per entry is requiring a case per backend.
+        for entry in BACKEND_NAMES {
+            if entry.kind == BackendNameKind::Stub {
+                // The documented exception above: nothing is discarded because
+                // nothing is transcribed.
+                continue;
+            }
+            if !cfg!(feature = "local-whisper") && matches!(entry.name, "local-whisper" | "local") {
+                // The real impl is not compiled in, so there is no answer to
+                // agree with. The default-feature run is where these are
+                // covered.
+                continue;
+            }
+            assert!(
+                cases.iter().any(|case| case.name == entry.name),
+                "{} is a backend validate() routes, so a user can select it and hit the \
+                 inert-prompt gate, but this test has no case for it. Add one — with the \
+                 backend's real impl, not a guess at its sends_prompt answer.",
+                entry.name
+            );
         }
 
         for case in &cases {
