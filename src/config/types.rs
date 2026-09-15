@@ -1894,18 +1894,11 @@ impl Config {
     /// it would silently flip the gate in [`Config::inert_prompt_warnings`] to
     /// the opposite answer from the one the wire gets.
     ///
-    /// `pub`, not private, for the same reason [`Config::deepgram_model`] is:
-    /// the model that actually goes on the wire is resolved by the daemon when
-    /// it builds the backend, and the daemon is a separate binary crate that
-    /// cannot be called from here. `get_model_for_backend` calls this instead
-    /// of keeping its own `"gpt-realtime-whisper"` literal, so the model this
-    /// gate reads and the model the session.update carries cannot drift apart
-    /// — exactly the rot `deepgram_model` was extracted to stop. One function,
-    /// one answer.
-    ///
-    /// `whisrs setup` still writes the same string by hand when it creates an
-    /// `[openai]` section for this backend. That copy is harmless, because the
-    /// value it writes is then read back through here, but it is the last one.
+    /// `pub` for the same reason [`Config::deepgram_model`] above is, and
+    /// `get_model_for_backend` calls it rather than keeping its own literal.
+    /// `whisrs setup` still writes the string by hand into the `[openai]`
+    /// section it creates; that copy is harmless, because the value is read
+    /// back through here, and it is the last one.
     pub fn openai_realtime_model(&self) -> String {
         self.openai
             .as_ref()
@@ -5225,33 +5218,27 @@ mod tests {
         }
     }
 
+    /// The gate and `sends_prompt` both read
+    /// `openai_turn_detection_mode_for_model`, so the totality test below
+    /// cannot catch that mapping itself moving: both sides move with it and
+    /// keep agreeing. This pins its absolute answers instead. The mixed-case
+    /// row is the one that matters in practice, since the mapping is
+    /// `eq_ignore_ascii_case` and a config is free to spell the model with
+    /// capitals; making it case-sensitive leaves every other test green.
     #[test]
-    fn config_inert_prompt_gate_tracks_the_openai_turn_detection_mapping() {
-        // `OpenAiRealtimeBackend::sends_prompt` is
-        // `!matches!(openai_turn_detection_mode_for_model(model), ManualCommit)`.
-        // The warning has to answer the same question off the same function,
-        // or it starts claiming a prompt is dropped that OpenAI did receive.
+    fn openai_turn_detection_mapping_is_case_insensitive() {
         for (model, manual_commit) in [
             ("gpt-realtime-whisper", true),
             ("GPT-Realtime-Whisper", true),
             ("gpt-4o-transcribe", false),
-            ("gpt-4o-mini-transcribe", false),
         ] {
-            let backend_drops_prompt = matches!(
-                openai_turn_detection_mode_for_model(model),
-                TurnDetectionMode::ManualCommit
-            );
             assert_eq!(
-                backend_drops_prompt, manual_commit,
-                "the turn-detection mapping for {model} moved; the warning gate moves with it"
-            );
-
-            let mut config = inert_prompt_config("openai-realtime");
-            config.openai.as_mut().unwrap().model = model.to_string();
-            let warned = !config.inert_prompt_warnings("openai-realtime").is_empty();
-            assert_eq!(
-                warned, backend_drops_prompt,
-                "the warning for model {model} must agree with sends_prompt, not guess"
+                matches!(
+                    openai_turn_detection_mode_for_model(model),
+                    TurnDetectionMode::ManualCommit
+                ),
+                manual_commit,
+                "the turn-detection mapping for {model} moved; the inert-prompt gate                  and every backend's sends_prompt move silently with it"
             );
         }
     }
@@ -5287,11 +5274,8 @@ mod tests {
     /// rejects any `[general] backend` outside that const before it reaches a
     /// match arm. So a new backend cannot be selectable without an entry in
     /// the const, and cannot have an entry in the const without a case here.
-    /// The previous version of this comment claimed the same thing without
-    /// that chain: `cases` was hand-written and derived from nothing, and a
-    /// reviewer who added a promptless "acme-realtime" to `validate` and to
-    /// `create_backend` — touching neither the gate nor this test — watched
-    /// all 663 tests stay green.
+    /// [`BACKEND_NAMES`]' own doc records what the hand-written case list this
+    /// replaced let through.
     ///
     /// Two limits, stated rather than implied. The daemon's `create_backend`
     /// lives in a separate binary crate and cannot be called from here, so
@@ -5349,6 +5333,14 @@ mod tests {
             SendsPromptCase {
                 name: "openai-realtime",
                 model: "gpt-4o-transcribe",
+                backend: Box::new(OpenAIRealtimeBackend::new(String::new())),
+            },
+            // The mapping is `eq_ignore_ascii_case`, so a config that spells
+            // the model with capitals still resolves to manual-commit. The
+            // gate reads the same function, so it has to agree here too.
+            SendsPromptCase {
+                name: "openai-realtime",
+                model: "GPT-Realtime-Whisper",
                 backend: Box::new(OpenAIRealtimeBackend::new(String::new())),
             },
             SendsPromptCase {

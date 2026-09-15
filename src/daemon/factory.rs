@@ -284,12 +284,9 @@ pub(crate) fn get_model_for_backend(config: &Config) -> String {
             .as_ref()
             .map(|g| g.model.clone())
             .unwrap_or_else(|| "whisper-large-v3-turbo".to_string()),
-        // Same pin, same reason: `Config::openai_realtime_model` is what
-        // `Config::validate`'s inert-prompt gate resolves the turn-detection
-        // mode from, so the model the startup warning describes is the model
-        // the session.update carries. A separate copy here would let the
-        // daemon warn that the prompt is dropped while sending it, or say
-        // nothing while dropping it.
+        // Same pin as the deepgram arm above: `Config::validate`'s
+        // inert-prompt gate resolves the turn-detection mode from this
+        // accessor, so a copy here could drift from what the wire carries.
         "openai-realtime" => config.openai_realtime_model(),
         "openai" => config
             .openai
@@ -547,15 +544,10 @@ mod tests {
     /// silent while dropping it. Same pin as the deepgram arm above, for the
     /// same reason.
     ///
-    /// What is pinned is the agreement, not the routing. Re-duplicating
-    /// `"gpt-realtime-whisper"` into `get_model_for_backend` keeps this test
-    /// green, because a copy that happens to hold the same string still
-    /// answers the same. What it catches is the copy drifting — which is the
-    /// failure that matters, and the only one that ever actually happened
-    /// (see the deepgram test, where the second literal said "nova-3" and
-    /// could have been flipped with the suite staying green). Making
-    /// re-duplication itself detectable would need machinery neither pin is
-    /// worth.
+    /// What is pinned is agreement, not routing. Re-duplicating the literal
+    /// keeps this green, since a copy holding the same string still answers
+    /// the same; drift is what it catches, and drift is the failure that
+    /// actually happened on the deepgram arm.
     #[test]
     fn openai_realtime_model_on_the_wire_is_the_one_the_prompt_gate_reads() {
         // No [openai] section at all: the fallback has to be the accessor's,
