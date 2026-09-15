@@ -2056,7 +2056,10 @@ impl Config {
     /// it bails with "local-whisper feature not enabled". Half the artifacts
     /// this project ships cannot act on that advice, and a warning cannot tell
     /// which binary it is running in. The test helper
-    /// `assert_no_stub_backend_advice` holds the line.
+    /// `assert_inert_prompt_advice_is_reachable` holds the line, and it bans
+    /// the name from the whole message rather than from the recommendation
+    /// sentences alone: a message here has no other reason to say it, so
+    /// there is nothing to lose by refusing every phrasing at once.
     fn inert_prompt_warnings(&self, backend: &str) -> Vec<ConfigWarning> {
         /// Which promptless backend the two messages below are describing.
         ///
@@ -3450,6 +3453,42 @@ mod tests {
         }
     }
 
+    /// [`assert_no_stub_backend_advice`], tightened for the messages
+    /// [`Config::inert_prompt_warnings`] builds: there `local-whisper` is
+    /// banned from the *whole* message, not only from the sentences
+    /// [`recommendation_sentences`] recognises as recommendations.
+    ///
+    /// The sentence scoping is a hole as soon as it is the only check. It
+    /// finds recommendations by their opening verb, so a sentence that
+    /// recommends without one of those verbs is not a recommendation as far
+    /// as it is concerned: appending "You can also run local-whisper
+    /// offline." to any of these messages left the whole suite green, because
+    /// the new sentence opened with none of the listed verbs and the message
+    /// still carried a qualifying `Switch ...` sentence, so the non-empty
+    /// assertion was satisfied too. Widening the verb list only moves the
+    /// hole — the next phrasing is one sentence away.
+    ///
+    /// These messages can afford the flat ban because none of them has any
+    /// business naming `local-whisper` at all: they are about `[general]
+    /// prompt` and `[general] vocabulary` on backends that drop them, and
+    /// local-whisper is neither the subject nor an admissible destination.
+    /// The two warnings that legitimately do name it — `[input] paste` and
+    /// `[general] llm_post_process`, which *describe* it as one of the
+    /// streaming backends that ignore the key, the second even interpolating
+    /// `backend = "local-whisper"` into its own text — are not built here,
+    /// and keep the looser helper.
+    fn assert_inert_prompt_advice_is_reachable(message: &str) {
+        assert_no_stub_backend_advice(message);
+        assert!(
+            !message.contains("local-whisper"),
+            "local-whisper is inert in the minimal release artifacts, which ship with \
+             --no-default-features, and nothing in an inert-prompt warning needs to name it: \
+             any mention at all reads as a way out, and it bails with \"local-whisper feature \
+             not enabled\" for half the users we ship to. Name groq, openai or asr-sidecar \
+             instead: {message}"
+        );
+    }
+
     #[test]
     fn config_parse_asr_sidecar_defaults() {
         let config: Config = toml::from_str(
@@ -4761,7 +4800,7 @@ mod tests {
             "the warning must name the backend: {}",
             warning.message
         );
-        assert_no_stub_backend_advice(&warning.message);
+        assert_inert_prompt_advice_is_reachable(&warning.message);
         assert_prompt_warning_offers_a_way_out(config, backend, &warning.message);
         warning.message.clone()
     }
@@ -4903,6 +4942,102 @@ mod tests {
         }
     }
 
+    /// A vocabulary the keyterm limits drop *part* of: more terms than
+    /// [`deepgram::KEYTERM_MAX_TERMS`] admits, each short enough that the term
+    /// count is what bites rather than [`deepgram::KEYTERM_QUERY_BUDGET_BYTES`]
+    /// or [`deepgram::KEYTERM_MAX_WORDS`].
+    ///
+    /// Sized off the cap rather than written out as a count, so it cannot rot
+    /// into an all-fit list when a limit moves: asking for more terms than the
+    /// term cap admits leaves at least one on the floor whatever the three
+    /// numbers are, and a raised cap that hands the byte budget or the word
+    /// cap the decision instead still drops some and keeps some. The caller
+    /// asserts the split is real before relying on it, so if some future
+    /// combination of limits does make this list fit whole, the test says so
+    /// instead of quietly passing.
+    fn partially_dropped_vocabulary() -> Vec<String> {
+        (0..deepgram::KEYTERM_MAX_TERMS + 5)
+            .map(|i| format!("term{i}"))
+            .collect()
+    }
+
+    #[test]
+    fn config_inert_prompt_on_deepgram_with_a_partial_keyterm_drop_points_at_the_vocabulary() {
+        // The Live/NothingFits boundary, which nothing else in this file
+        // stands on. `deepgram_hint_channel` asks whether `effective_keyterms`
+        // is *empty*, not whether it is *short*, and that is the whole reason
+        // the NothingFits arm can say "none of the N term(s) ... fit" — it is
+        // only reached when none do. Widening the test to `effective < usable`
+        // leaves every other test here green while making this config print
+        // "none of the 205 term(s) in [general] vocabulary fit the keyterm
+        // limits" directly beneath `deepgram_keyterm_warnings`' "200 of 205
+        // usable term(s) reach Deepgram": the same contradiction the
+        // three-state channel was introduced to remove, with the numbers
+        // swapped. The two warnings are built from one pair of functions
+        // precisely so they cannot disagree about a number, and a partial drop
+        // is the only shape where the wrong test disagrees.
+        for backend in ["deepgram", "deepgram-streaming"] {
+            let mut config = inert_prompt_config(backend);
+            // `validatable_config` pins the default nova-3, so the model takes
+            // keyterm and only the limits decide how much arrives.
+            config.general.vocabulary = partially_dropped_vocabulary();
+            assert!(
+                deepgram::supports_keyterm(&config.deepgram_model()),
+                "a partial drop needs a model that takes keyterm at all"
+            );
+
+            let usable = deepgram::usable_keyterms(&config.general.vocabulary).count();
+            let effective = deepgram::effective_keyterms(&config.general.vocabulary).len();
+            assert!(
+                effective > 0 && effective < usable,
+                "this fixture is a boundary case only while the limits drop *some* of it; \
+                 {effective} of {usable} terms reach the wire"
+            );
+
+            let warnings = config.validate().unwrap();
+            let keyterm = warnings
+                .iter()
+                .find(|w| w.message.contains("usable term(s) reach"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the keyterm limits drop part of this vocabulary; this test needs both \
+                         warnings present to show they agree, got: {warnings:?}"
+                    )
+                });
+            assert!(
+                keyterm
+                    .message
+                    .contains(&format!("{effective} of {usable} usable term(s) reach")),
+                "the keyterm warning has to report the partial delivery this case is about: {}",
+                keyterm.message
+            );
+
+            assert!(
+                matches!(config.deepgram_hint_channel(), DeepgramHintChannel::Live),
+                "{effective} of {usable} term(s) are reaching Deepgram, so the keyterm channel \
+                 is live and the prompt warning is allowed to point at it"
+            );
+
+            let prompt = prompt_warning_through_validate(&config, backend);
+            assert!(
+                prompt.contains("Use [general] vocabulary instead"),
+                "part of the vocabulary does reach the model, so the channel that works is \
+                 still the way out: {prompt}"
+            );
+            assert!(
+                !prompt.contains("fit the keyterm limits"),
+                "that clause is the NothingFits prose and it says none of the terms fit, while \
+                 {effective} of {usable} do — printing it here contradicts the keyterm warning \
+                 one line above: {prompt}"
+            );
+            assert!(
+                !prompt.contains("Trim [general] vocabulary"),
+                "trimming is the NothingFits way out; with a live channel the warning has to \
+                 point at the channel instead: {prompt}"
+            );
+        }
+    }
+
     /// Pull the "[general] vocabulary is ignored with backend" warning out of
     /// `validate()`, with the checks every shape of it must satisfy.
     fn vocabulary_warning_through_validate(config: &Config, backend: &str) -> String {
@@ -4919,7 +5054,7 @@ mod tests {
                      expected a warning, got: {warnings:?}"
                 )
             });
-        assert_no_stub_backend_advice(&warning.message);
+        assert_inert_prompt_advice_is_reachable(&warning.message);
         warning.message.clone()
     }
 
@@ -5051,7 +5186,7 @@ mod tests {
                 "the warning must name a backend the user can actually switch to: {}",
                 warning.message
             );
-            assert_no_stub_backend_advice(&warning.message);
+            assert_inert_prompt_advice_is_reachable(&warning.message);
         }
     }
 

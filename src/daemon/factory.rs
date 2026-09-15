@@ -536,17 +536,28 @@ mod tests {
         );
     }
 
-    /// The openai-realtime arm must resolve through
-    /// `Config::openai_realtime_model`, not a second literal here.
+    /// The model the openai-realtime arm puts on the wire is the model
+    /// `Config::openai_realtime_model` reports, on an absent `[openai]`
+    /// section and on an explicit one.
     ///
     /// `Config::validate`'s inert-prompt warning derives the turn-detection
     /// mode from that accessor, and the mode decides whether the session.update
-    /// carries `[general] prompt` at all. A private copy in this file would let
-    /// the two disagree in both directions: the daemon warning that the prompt
-    /// is dropped while sending it, or staying silent while dropping it. Same
-    /// pin as the deepgram arm, for the same reason.
+    /// carries `[general] prompt` at all. Let the two answers drift apart and
+    /// the daemon warns that the prompt is dropped while sending it, or stays
+    /// silent while dropping it. Same pin as the deepgram arm above, for the
+    /// same reason.
+    ///
+    /// What is pinned is the agreement, not the routing. Re-duplicating
+    /// `"gpt-realtime-whisper"` into `get_model_for_backend` keeps this test
+    /// green, because a copy that happens to hold the same string still
+    /// answers the same. What it catches is the copy drifting — which is the
+    /// failure that matters, and the only one that ever actually happened
+    /// (see the deepgram test, where the second literal said "nova-3" and
+    /// could have been flipped with the suite staying green). Making
+    /// re-duplication itself detectable would need machinery neither pin is
+    /// worth.
     #[test]
-    fn openai_realtime_model_resolves_through_the_config_accessor() {
+    fn openai_realtime_model_on_the_wire_is_the_one_the_prompt_gate_reads() {
         // No [openai] section at all: the fallback has to be the accessor's,
         // which is the case `whisrs setup` leaves behind for anyone who wrote
         // the config by hand.
@@ -559,7 +570,8 @@ mod tests {
         assert_eq!(
             get_model_for_backend(&absent),
             absent.openai_realtime_model(),
-            "the daemon must not carry its own realtime-model fallback"
+            "the model the daemon sends and the model the inert-prompt gate reads have \
+             diverged on the fallback"
         );
 
         // An explicit model: still the accessor, and still the configured
@@ -573,7 +585,8 @@ mod tests {
         assert_eq!(
             get_model_for_backend(&explicit),
             explicit.openai_realtime_model(),
-            "an explicit model must reach the wire through the same accessor"
+            "the model the daemon sends and the model the inert-prompt gate reads have \
+             diverged on an explicit [openai] model"
         );
     }
 }
