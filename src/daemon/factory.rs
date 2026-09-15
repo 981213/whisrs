@@ -284,11 +284,10 @@ pub(crate) fn get_model_for_backend(config: &Config) -> String {
             .as_ref()
             .map(|g| g.model.clone())
             .unwrap_or_else(|| "whisper-large-v3-turbo".to_string()),
-        "openai-realtime" => config
-            .openai
-            .as_ref()
-            .map(|o| o.model.clone())
-            .unwrap_or_else(|| "gpt-realtime-whisper".to_string()),
+        // Same pin as the deepgram arm above: `Config::validate`'s
+        // inert-prompt gate resolves the turn-detection mode from this
+        // accessor, so a copy here could drift from what the wire carries.
+        "openai-realtime" => config.openai_realtime_model(),
         "openai" => config
             .openai
             .as_ref()
@@ -531,6 +530,55 @@ mod tests {
             local_whisper_settings(&absent).model_path,
             local_whisper_settings(&bare).model_path,
             "an absent section and a section without model_path load different models"
+        );
+    }
+
+    /// The model the openai-realtime arm puts on the wire is the model
+    /// `Config::openai_realtime_model` reports, on an absent `[openai]`
+    /// section and on an explicit one.
+    ///
+    /// `Config::validate`'s inert-prompt warning derives the turn-detection
+    /// mode from that accessor, and the mode decides whether the session.update
+    /// carries `[general] prompt` at all. Let the two answers drift apart and
+    /// the daemon warns that the prompt is dropped while sending it, or stays
+    /// silent while dropping it. Same pin as the deepgram arm above, for the
+    /// same reason.
+    ///
+    /// What is pinned is agreement, not routing. Re-duplicating the literal
+    /// keeps this green, since a copy holding the same string still answers
+    /// the same; drift is what it catches, and drift is the failure that
+    /// actually happened on the deepgram arm.
+    #[test]
+    fn openai_realtime_model_on_the_wire_is_the_one_the_prompt_gate_reads() {
+        // No [openai] section at all: the fallback has to be the accessor's,
+        // which is the case `whisrs setup` leaves behind for anyone who wrote
+        // the config by hand.
+        let absent: Config = toml::from_str("[general]\nbackend = \"openai-realtime\"\n")
+            .expect("[openai] is optional");
+        assert!(
+            absent.openai.is_none(),
+            "the fixture must exercise the fallback"
+        );
+        assert_eq!(
+            get_model_for_backend(&absent),
+            absent.openai_realtime_model(),
+            "the model the daemon sends and the model the inert-prompt gate reads have \
+             diverged on the fallback"
+        );
+
+        // An explicit model: still the accessor, and still the configured
+        // string rather than the plain-openai serde default.
+        let explicit: Config = toml::from_str(
+            "[general]\nbackend = \"openai-realtime\"\n\
+             [openai]\napi_key = \"test-key\"\nmodel = \"gpt-4o-transcribe\"\n",
+        )
+        .expect("an [openai] section with a model parses");
+        assert_eq!(get_model_for_backend(&explicit), "gpt-4o-transcribe");
+        assert_eq!(
+            get_model_for_backend(&explicit),
+            explicit.openai_realtime_model(),
+            "the model the daemon sends and the model the inert-prompt gate reads have \
+             diverged on an explicit [openai] model"
         );
     }
 }
