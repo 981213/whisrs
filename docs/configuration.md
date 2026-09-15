@@ -34,6 +34,8 @@ prompt = "Speech is in English or Spanish. Transcribe in the language spoken; ne
                             # reaches it. openai-realtime sends a prompt only on
                             # server-VAD models like gpt-4o-transcribe, not on the
                             # gpt-realtime-whisper that `whisrs setup` writes for it)
+                            # `whisrsd` warns at startup if either key targets a backend
+                            # that discards it. `whisrs config` warns the same on save.
 tray = true                 # system tray icon (requires SNI host like waybar)
 overlay = false             # bottom-screen recording overlay (Hyprland/Sway, GNOME extension)
 

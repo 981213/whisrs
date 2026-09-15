@@ -284,11 +284,13 @@ pub(crate) fn get_model_for_backend(config: &Config) -> String {
             .as_ref()
             .map(|g| g.model.clone())
             .unwrap_or_else(|| "whisper-large-v3-turbo".to_string()),
-        "openai-realtime" => config
-            .openai
-            .as_ref()
-            .map(|o| o.model.clone())
-            .unwrap_or_else(|| "gpt-realtime-whisper".to_string()),
+        // Same pin, same reason: `Config::openai_realtime_model` is what
+        // `Config::validate`'s inert-prompt gate resolves the turn-detection
+        // mode from, so the model the startup warning describes is the model
+        // the session.update carries. A separate copy here would let the
+        // daemon warn that the prompt is dropped while sending it, or say
+        // nothing while dropping it.
+        "openai-realtime" => config.openai_realtime_model(),
         "openai" => config
             .openai
             .as_ref()
@@ -531,6 +533,47 @@ mod tests {
             local_whisper_settings(&absent).model_path,
             local_whisper_settings(&bare).model_path,
             "an absent section and a section without model_path load different models"
+        );
+    }
+
+    /// The openai-realtime arm must resolve through
+    /// `Config::openai_realtime_model`, not a second literal here.
+    ///
+    /// `Config::validate`'s inert-prompt warning derives the turn-detection
+    /// mode from that accessor, and the mode decides whether the session.update
+    /// carries `[general] prompt` at all. A private copy in this file would let
+    /// the two disagree in both directions: the daemon warning that the prompt
+    /// is dropped while sending it, or staying silent while dropping it. Same
+    /// pin as the deepgram arm, for the same reason.
+    #[test]
+    fn openai_realtime_model_resolves_through_the_config_accessor() {
+        // No [openai] section at all: the fallback has to be the accessor's,
+        // which is the case `whisrs setup` leaves behind for anyone who wrote
+        // the config by hand.
+        let absent: Config = toml::from_str("[general]\nbackend = \"openai-realtime\"\n")
+            .expect("[openai] is optional");
+        assert!(
+            absent.openai.is_none(),
+            "the fixture must exercise the fallback"
+        );
+        assert_eq!(
+            get_model_for_backend(&absent),
+            absent.openai_realtime_model(),
+            "the daemon must not carry its own realtime-model fallback"
+        );
+
+        // An explicit model: still the accessor, and still the configured
+        // string rather than the plain-openai serde default.
+        let explicit: Config = toml::from_str(
+            "[general]\nbackend = \"openai-realtime\"\n\
+             [openai]\napi_key = \"test-key\"\nmodel = \"gpt-4o-transcribe\"\n",
+        )
+        .expect("an [openai] section with a model parses");
+        assert_eq!(get_model_for_backend(&explicit), "gpt-4o-transcribe");
+        assert_eq!(
+            get_model_for_backend(&explicit),
+            explicit.openai_realtime_model(),
+            "an explicit model must reach the wire through the same accessor"
         );
     }
 }
