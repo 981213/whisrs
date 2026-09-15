@@ -71,25 +71,164 @@ pub(crate) const WHISPER_MODEL_CHOICES: &[&str] = &[
 ];
 pub(crate) const WHISPER_MODEL_NAMES: &[&str] = &["tiny.en", "base.en", "small.en"];
 
+/// What the interactive flows found at the config path.
+///
+/// Before issue #134 this was an `Option` and collapsed four outcomes into
+/// `None`: no file, an unreadable file, invalid TOML, and valid TOML that does
+/// not deserialize into [`Config`]. Both callers read `None` as "no config
+/// file" and went on to write one from defaults, which deleted every section
+/// the defaults leave `None` — API keys included — with no backup. The three
+/// cases that differ in what the caller must do are separate variants now.
+// `Loaded` makes the enum `Config`-sized (~1.2 KB). It is returned by value
+// exactly once per `whisrs setup` / `whisrs config` invocation and never
+// collected, so boxing would buy an allocation and cost the callers a deref.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum ExistingConfig {
+    /// No file at the path: first run, nothing to preserve.
+    Missing,
+    /// A file is there and cannot be used. `message` is what to show the user,
+    /// underlying error verbatim — the `toml` crate's error names the line,
+    /// column and offending value, which is the single most useful thing the
+    /// user gets out of this. `kind` decides what the caller can offer to do
+    /// about it.
+    Unusable { kind: UnusableKind, message: String },
+    /// A usable file, together with the keys in it the schema does not know.
+    Loaded {
+        config: Config,
+        unknown: Vec<String>,
+    },
+}
+
+/// Why an [`ExistingConfig::Unusable`] file is unusable — the distinction that
+/// decides whether writing a fresh config over it can work at all.
+///
+/// Fusing the two was the second half of issue #134: `run_setup` warned that the
+/// old file would be "backed up when the new config is written", asked every
+/// wizard question, and only then hit `write_config_to`'s own
+/// `fs::read_to_string`, which failed exactly as the load had. Nothing written,
+/// no `.bak`, every answer discarded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnusableKind {
+    /// The bytes could not be read at all: mode bits, a root-owned file left by
+    /// a `sudo whisrs setup`, a directory at the path, non-UTF-8 content in it.
+    /// Rewriting cannot help, because
+    /// the write reads the file first and fails the same way. Only a hand fix
+    /// gets out of this, so neither flow may offer `whisrs setup`.
+    Unreadable,
+    /// Read fine — valid TOML or not — but does not deserialize into [`Config`].
+    /// Regenerating from scratch works, and [`backup_and_regenerate`] preserves
+    /// the original as `.bak`.
+    Undeserializable,
+}
+
 /// Try to load an existing config from disk, together with the keys in it the
 /// schema does not know.
 ///
 /// The daemon warns about those keys via `tracing`, which prints nothing in the
 /// CLI flows, so both interactive entry points get the list here and say so
 /// themselves (issue #116).
-pub(crate) fn load_existing_config() -> Option<(Config, Vec<String>)> {
+pub(crate) fn load_existing_config() -> ExistingConfig {
     load_existing_config_from(&crate::config_path())
 }
 
 /// Implementation of [`load_existing_config`] against an explicit path
 /// (testable).
-fn load_existing_config_from(path: &Path) -> Option<(Config, Vec<String>)> {
-    if !path.exists() {
-        return None;
+fn load_existing_config_from(path: &Path) -> ExistingConfig {
+    // `NotFound` is the missing file, rather than a preceding `path.exists()`:
+    // the pre-check left a window in which a file deleted between the two calls
+    // came back as `Unusable("...No such file or directory")`, i.e. `whisrs
+    // config` telling the user to hand-fix a file that is not there. One `open`
+    // makes the function total and removes the TOCTOU.
+    //
+    // Wording is shared with the daemon's loader (`daemon::startup::load_config`
+    // says "Failed to read/parse config at {path}: {e} — using defaults"), so
+    // the two name the same broken file the same way. Lowercase and without the
+    // trailing fallback: neither CLI flow silently falls back to defaults, and
+    // `src/cli/main.rs` prints this after "config failed: " / "setup failed: ".
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ExistingConfig::Missing,
+        Err(e) => {
+            return ExistingConfig::Unusable {
+                kind: UnusableKind::Unreadable,
+                message: format!("cannot read config at {}: {e}", path.display()),
+            };
+        }
+    };
+    match toml::from_str::<Config>(&contents) {
+        Ok(config) => ExistingConfig::Loaded {
+            config,
+            unknown: unknown_config_keys(&contents),
+        },
+        // `toml::de::Error` renders with a trailing newline. Trimmed here rather
+        // than at each consumer: every one of them continues the sentence, so
+        // the newline would leave a blank line mid-message.
+        Err(e) => ExistingConfig::Unusable {
+            kind: UnusableKind::Undeserializable,
+            message: format!("cannot parse config at {}: {e}", path.display())
+                .trim_end()
+                .to_string(),
+        },
     }
-    let contents = fs::read_to_string(path).ok()?;
-    let config = toml::from_str(&contents).ok()?;
-    Some((config, unknown_config_keys(&contents)))
+}
+
+/// Where [`write_config_to`] parks the previous contents of `config_path` when
+/// it has to regenerate the file from scratch.
+fn config_backup_path(config_path: &Path) -> PathBuf {
+    let file_name = config_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    config_path.with_file_name(format!("{file_name}.bak"))
+}
+
+/// The full text `whisrs config` fails with when the file on disk is
+/// [`ExistingConfig::Unusable`]: the message, then what to do about it, which
+/// depends on whether rewriting the file could work at all.
+///
+/// Returned as the error rather than printed, because `src/cli/main.rs` already
+/// renders it once as `config failed: {e:#}` and exits non-zero; printing it
+/// here as well would show the user the same serde error twice.
+pub(crate) fn unusable_config_refusal(
+    kind: UnusableKind,
+    message: &str,
+    config_path: &Path,
+) -> String {
+    match kind {
+        UnusableKind::Unreadable => unreadable_config_refusal(message, config_path),
+        UnusableKind::Undeserializable => format!(
+            "{message}\n\nNothing was changed. Fix {} by hand, or run `whisrs setup` to start from \
+             a fresh config (it backs the current file up to {} first).",
+            config_path.display(),
+            config_backup_path(config_path).display()
+        ),
+    }
+}
+
+/// The refusal both flows share for [`UnusableKind::Unreadable`], because both
+/// can only refuse: the write reads the file first, so `whisrs setup` fails on
+/// exactly the read that just failed. Offering it would send the user around a
+/// loop that cannot terminate, which is why this text names the hand fix only.
+fn unreadable_config_refusal(message: &str, config_path: &Path) -> String {
+    let path = config_path.display();
+    format!(
+        "{message}\n\nNothing was changed, and rewriting the file cannot help: `whisrs setup` \
+         writes the config by reading it first, so it fails on the same read. Fix it by hand. The \
+         usual cause is ownership or permissions: a config written by `sudo whisrs setup` belongs \
+         to root. Check that {path} is a regular file, owned by you and readable at mode 0600:\
+         \n\n    sudo chown $USER {path}\n    chmod 600 {path}"
+    )
+}
+
+/// The warning `whisrs setup` prints for an [`UnusableKind::Undeserializable`]
+/// file. Setup's job is to produce a config, so it says what it found and
+/// carries on into the wizard; the write at the end keeps the old file as `.bak`.
+fn undeserializable_config_setup_warning(message: &str, config_path: &Path) -> String {
+    format!(
+        "{message}\nThe existing config cannot be used, so setup starts fresh; the current file is \
+         backed up to {} when the new config is written.",
+        config_backup_path(config_path).display()
+    )
 }
 
 /// Print the unknown-key warning for a config just loaded from disk, if there
@@ -117,26 +256,61 @@ pub fn run_setup() -> Result<()> {
     println!("\n{BOLD}whisrs setup{RESET} — interactive onboarding\n");
 
     // Check for existing config.
-    if let Some((existing_cfg, unknown)) = load_existing_config() {
-        println!(
-            "  {GREEN}Found existing config{RESET} (backend: {BOLD}{}{RESET})",
-            existing_cfg.general.backend
-        );
-        // Before the prompt, not after: "Use existing" returns immediately
-        // below, so a warning printed later would never be shown at all.
-        print_unknown_keys_warning(&unknown);
-        println!();
-        let choice = Select::new()
-            .with_prompt("What would you like to do?")
-            .items(&["Use existing", "Start fresh"])
-            .default(0)
-            .interact()
-            .context("failed to read setup mode")?;
-        if choice == 0 {
-            println!("\n  {GREEN}Keeping existing config.{RESET}");
-            print_done();
-            return Ok(());
+    match load_existing_config() {
+        ExistingConfig::Loaded {
+            config: existing_cfg,
+            unknown,
+        } => {
+            println!(
+                "  {GREEN}Found existing config{RESET} (backend: {BOLD}{}{RESET})",
+                existing_cfg.general.backend
+            );
+            // Before the prompt, not after: "Use existing" returns immediately
+            // below, so a warning printed later would never be shown at all.
+            print_unknown_keys_warning(&unknown);
+            println!();
+            let choice = Select::new()
+                .with_prompt("What would you like to do?")
+                .items(&["Use existing", "Start fresh"])
+                .default(0)
+                .interact()
+                .context("failed to read setup mode")?;
+            if choice == 0 {
+                println!("\n  {GREEN}Keeping existing config.{RESET}");
+                print_done();
+                return Ok(());
+            }
         }
+        // A file we cannot read at all is a refusal, and it has to come before
+        // the first question (issue #134). Warning and continuing here promised a
+        // `.bak` that cannot be written, ran the whole wizard — backend, key,
+        // language, service install — and then died in `write_config_to`'s own
+        // `fs::read_to_string`, discarding every answer. Nothing downstream can
+        // recover from an unreadable file, so stop while the user has typed
+        // nothing.
+        ExistingConfig::Unusable {
+            kind: UnusableKind::Unreadable,
+            message,
+        } => {
+            anyhow::bail!(unreadable_config_refusal(&message, &crate::config_path()));
+        }
+        // A file we did read but cannot deserialize used to land here silently
+        // (the other half of #134): setup said nothing and ran the new-install
+        // wizard, and the write at the end of it ate the sections the wizard
+        // leaves unset. Say what is wrong, then carry on — producing a config is
+        // the whole point of setup, so refusing would be wrong, and
+        // `write_config_to` keeps the broken file as `.bak`.
+        ExistingConfig::Unusable {
+            kind: UnusableKind::Undeserializable,
+            message,
+        } => {
+            println!(
+                "  {YELLOW}warning:{RESET} {}",
+                undeserializable_config_setup_warning(&message, &crate::config_path())
+            );
+            println!();
+        }
+        ExistingConfig::Missing => {}
     }
 
     // 1. Select backend.
@@ -850,63 +1024,62 @@ pub(crate) fn write_config_to(config: &Config, config_path: &Path) -> Result<()>
     let fresh_str = toml::to_string_pretty(config).context("failed to serialize config to TOML")?;
     let mut output = match fs::read_to_string(config_path) {
         Ok(existing_str) => match existing_str.parse::<DocumentMut>() {
-            Ok(mut existing) => {
-                let fresh: DocumentMut = fresh_str
-                    .parse()
-                    .context("failed to reparse serialized config")?;
-                // Derived from the bytes on disk, on every write: a set built
-                // from `fresh_str`, or cached across writes, would describe
-                // keys that are not there and break byte-stability.
+            // Derived from the bytes on disk, on every write: a set built from
+            // `fresh_str`, or cached across writes, would describe keys that are
+            // not there and break byte-stability.
+            //
+            // "Every write" includes the daemon's LLM-command `set` path, not
+            // just the interactive flows. Measured cost of the scan: +175 us on a
+            // clean synthetic config, +2.2 ms on a real one, 148 ms on a
+            // pathological 200-unknown-section file. The confirmation pass only
+            // runs for keys the cheap reserialize diff already flagged, so a clean
+            // config pays for the diff and nothing else — fine in practice, no
+            // optimization wanted.
+            //
+            // This one call also decides *whether* to merge. The set is what the
+            // merge's stale-key pass consults, so asking it directly is the only
+            // condition that cannot drift from what the merge will do: an empty
+            // set means "understood, nothing unknown", an error means "these bytes
+            // cannot be described". Re-deriving the answer here from a separate
+            // `toml::from_str::<Config>` agreed only by coincidence — it missed
+            // the reserialization failure, which would have merged against an
+            // empty set and deleted the unknown sections all over again (#134).
+            Ok(mut existing) => match PreservedKeys::from_config_str(&existing_str) {
+                Ok(preserved) => {
+                    let fresh: DocumentMut = fresh_str
+                        .parse()
+                        .context("failed to reparse serialized config")?;
+                    merge_table(existing.as_table_mut(), fresh.as_table(), &preserved);
+                    existing.to_string()
+                }
+                // A file with no preserve set cannot be merged into: the
+                // stale-key pass would delete every section the struct does not
+                // carry — API keys included — and the `.bak` backstop below never
+                // fired, because it was reached only for a file that is not TOML
+                // at all. That was issue #134. Same treatment here: back the file
+                // up byte for byte and regenerate.
                 //
-                // "Every write" includes the daemon's LLM-command `set` path,
-                // not just the interactive flows. Measured cost of the scan:
-                // +175 us on a clean synthetic config, +2.2 ms on a real one,
-                // 148 ms on a pathological 200-unknown-section file. The
-                // confirmation pass only runs for keys the cheap reserialize
-                // diff already flagged, so a clean config pays for the diff and
-                // nothing else — fine in practice, no optimization wanted.
-                let preserved = PreservedKeys::from_config_str(&existing_str);
-                merge_table(existing.as_table_mut(), fresh.as_table(), &preserved);
-                existing.to_string()
-            }
+                // Not a merge with a smarter preserve set on purpose: keeping an
+                // aliased section (`[local]`, `[asr]`, `[vibevoice]`) beside the
+                // canonical one the writer emits makes the result fail to load
+                // with `duplicate field`, which is total config loss (see
+                // [`is_preserved`]).
+                Err(reason) => {
+                    backup_and_regenerate(config_path, &existing_str, &reason.to_string())?;
+                    fresh_str
+                }
+            },
+            // Unparseable on-disk file: there is no layout to preserve, so
+            // fall back to regenerating it from the struct (pre-#82
+            // behavior). This branch skips the merge entirely, so unknown
+            // keys are lost here by design — the file is kept verbatim as
+            // `.bak`, which is the recovery path for them.
             Err(e) => {
-                // Unparseable on-disk file: there is no layout to preserve, so
-                // fall back to regenerating it from the struct (pre-#82
-                // behavior). This branch skips the merge entirely, so unknown
-                // keys are lost here by design — the file is kept verbatim as
-                // `.bak` below, which is the recovery path for them.
-                // The broken file is the only copy of the user's
-                // hand-edits, so save it as a private backup first (it may
-                // hold API keys, hence 0600) and refuse to proceed if that
-                // backup cannot be written.
-                let file_name = config_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("config.toml");
-                let backup_path = config_path.with_file_name(format!("{file_name}.bak"));
-                write_private_file(&backup_path, &existing_str).with_context(|| {
-                    format!(
-                        "existing config {} is not valid TOML ({e}), and backing it up to {} \
-                         failed; refusing to overwrite the only copy",
-                        config_path.display(),
-                        backup_path.display()
-                    )
-                })?;
-                // `tracing` alone is invisible in the CLI flows (`whisrs
-                // setup` / `whisrs config` install no subscriber that prints
-                // warnings), so tell the user on stderr as well.
-                tracing::warn!(
-                    "existing config at {} is not valid TOML ({e}); rewriting it from scratch \
-                     (backup saved to {})",
-                    config_path.display(),
-                    backup_path.display()
-                );
-                eprintln!(
-                    "warning: existing config at {} is not valid TOML ({e}); rewriting it from \
-                     scratch (backup saved to {})",
-                    config_path.display(),
-                    backup_path.display()
-                );
+                backup_and_regenerate(
+                    config_path,
+                    &existing_str,
+                    &format!("is not valid TOML ({e})"),
+                )?;
                 fresh_str
             }
         },
@@ -935,17 +1108,59 @@ pub(crate) fn write_config_to(config: &Config, config_path: &Path) -> Result<()>
         .with_context(|| format!("failed to write config to {}", config_path.display()))
 }
 
+/// Park the current contents of `config_path` in a private `.bak` beside it and
+/// tell the user the file is about to be regenerated from the struct.
+///
+/// The shared body of the two [`write_config_to`] branches that cannot merge
+/// into the file on disk — `toml_edit` could not parse it, or it has no
+/// [`PreservedKeys`] set describing it. `reason` completes the sentence "existing
+/// config at `<path>` …" and is the only thing that differs between them.
+///
+/// The broken file is the only copy of the user's hand-edits, so it is saved
+/// first, at 0600 because it may hold API keys, and an error here aborts the
+/// write rather than overwriting the only copy.
+fn backup_and_regenerate(config_path: &Path, existing_str: &str, reason: &str) -> Result<()> {
+    let backup_path = config_backup_path(config_path);
+    write_private_file(&backup_path, existing_str).with_context(|| {
+        format!(
+            "existing config {} {reason}, and backing it up to {} failed; refusing to overwrite \
+             the only copy",
+            config_path.display(),
+            backup_path.display()
+        )
+    })?;
+    // `tracing` alone is invisible in the CLI flows (`whisrs setup` / `whisrs
+    // config` install no subscriber that prints warnings), so tell the user on
+    // stderr as well.
+    tracing::warn!(
+        "existing config at {} {reason}; rewriting it from scratch (backup saved to {})",
+        config_path.display(),
+        backup_path.display()
+    );
+    eprintln!(
+        "warning: existing config at {} {reason}; rewriting it from scratch (backup saved to {})",
+        config_path.display(),
+        backup_path.display()
+    );
+    Ok(())
+}
+
 /// Sync `existing` (the user's on-disk TOML, decor intact) to hold exactly the
 /// keys and values of `fresh` (the reserialized struct), plus whatever
 /// `preserved` marks as confirmed-unknown. Matching keys keep their comments
 /// and formatting, recursing into sub-tables; keys missing from `fresh` are
 /// removed unless preserved; new keys are appended.
 ///
-/// `preserved` is the node for *this* table. Three deliberate gaps remain:
+/// `preserved` is the node for *this* table. A file the preserve set cannot
+/// describe — not TOML, not a `Config`, or a `Config` that does not reserialize
+/// — used to arrive here as an *empty* set, which made the merge delete every
+/// section the struct does not carry: issue #134. That cannot happen now.
+/// [`write_config_to`] branches on `PreservedKeys::from_config_str` itself and
+/// diverts such a file to [`backup_and_regenerate`] before the merge is reached,
+/// so an empty set here always means "described, nothing unknown".
 ///
-/// * A file that is valid TOML but does not deserialize gets an empty preserve
-///   set (`unknown_config_keys` reports nothing for it), so its keys are still
-///   deleted. That is issue #134, not this function's problem.
+/// Two deliberate gaps remain:
+///
 /// * `llm_commands = [{ name = "x", bogus = 1 }]` written as an array of
 ///   *inline* tables takes `merge_item`'s catch-all and is replaced wholesale,
 ///   losing `bogus`. Pre-existing; the `[[llm_commands]]` spelling is handled.
@@ -2393,6 +2608,23 @@ fn print_done() {
     println!();
 }
 
+/// `source` with its whole-line `//` comments dropped, for the tests that assert
+/// on the control flow of a function too interactive to call.
+///
+/// Those tests search a slice of source text for spellings like `return` and
+/// `bail!`. The arms they slice carry long explanations, so without this a
+/// comment that merely *mentions* returning would fail a test checking that the
+/// code does not return. Whole lines only: a trailing comment after code is not
+/// worth the quote-tracking, and none of the checked arms has one.
+#[cfg(test)]
+pub(in crate::config) fn source_without_comments(source: &str) -> String {
+    source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2622,6 +2854,18 @@ hotkey = "Super+Shift+P"
 instruction = "Polish the text."
 "#;
 
+    /// The issue #134 repro: valid TOML, so `toml_edit` parses it happily, but
+    /// `silence_timeout_ms` is quoted and so it does not deserialize into
+    /// `Config`. The API key is what the user stood to lose.
+    const CONFIG_THAT_DOES_NOT_DESERIALIZE: &str = r#"[general]
+backend = "groq"
+silence_timeout_ms = "2000"
+
+[groq]
+api_key = "sk-my-real-secret-key"
+model = "whisper-large-v3-turbo"
+"#;
+
     fn parse_config(toml_str: &str) -> Config {
         toml::from_str(toml_str).expect("fixture should deserialize")
     }
@@ -2786,6 +3030,214 @@ instruction = "Polish the text."
             let mode = fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "backup may hold API keys, must be 0600");
         }
+    }
+
+    /// Issue #134: valid TOML that does not deserialize used to reach the merge
+    /// with an empty preserve set, which deleted every section the struct does
+    /// not carry, and the `.bak` backstop never fired because it only covered
+    /// files that are not TOML at all.
+    #[test]
+    fn existing_file_that_does_not_deserialize_is_backed_up_and_regenerated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, CONFIG_THAT_DOES_NOT_DESERIALIZE).unwrap();
+
+        // What both CLI flows do next: write a config built without any
+        // knowledge of the file on disk (the wizard's, or `default_config()`).
+        let config = parse_config(COMMENTED_CONFIG);
+        write_config_to(&config, &path).unwrap();
+
+        // The rewritten file loads — it is a config again, not a second broken one.
+        let reparsed: Config = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(reparsed.general.backend, "groq");
+
+        // And the file it replaced survives byte for byte, 0600 because it may
+        // hold API keys (this fixture does).
+        let backup = dir.path().join("config.toml.bak");
+        assert_eq!(
+            fs::read(&backup).unwrap(),
+            CONFIG_THAT_DOES_NOT_DESERIALIZE.as_bytes()
+        );
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "backup may hold API keys, must be 0600");
+        }
+    }
+
+    /// The user-visible stake of issue #134: the `[groq] api_key` in a file the
+    /// flow could not read still leaves the live config (the struct being
+    /// written has no `[groq]` at all), but it is recoverable from the backup
+    /// instead of gone without a trace.
+    #[test]
+    fn api_key_of_an_undeserializable_config_survives_in_the_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, CONFIG_THAT_DOES_NOT_DESERIALIZE).unwrap();
+
+        write_config_to(&parse_config(COMMENTED_CONFIG), &path).unwrap();
+
+        let out = fs::read_to_string(&path).unwrap();
+        assert!(
+            !out.contains("sk-my-real-secret-key"),
+            "the struct being written has no [groq]; nothing should invent one\n{out}"
+        );
+        let backup = fs::read_to_string(dir.path().join("config.toml.bak")).unwrap();
+        assert!(backup.contains("[groq]"), "{backup}");
+        assert!(
+            backup.contains(r#"api_key = "sk-my-real-secret-key""#),
+            "{backup}"
+        );
+    }
+
+    /// The second write after a divert must take the merge path, because the
+    /// file it now finds is one it just wrote.
+    ///
+    /// Safe today only because `fresh_str` round-trips and `HOOKS_HINT` is
+    /// comments: if any `Config` field ever stops round-tripping, every
+    /// subsequent write diverts again and overwrites the `.bak` with the
+    /// regenerated file, destroying the user's only copy of the original. The
+    /// backup has to survive writes that follow the one that made it.
+    #[test]
+    fn a_second_write_after_a_divert_keeps_the_first_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let backup = dir.path().join("config.toml.bak");
+        fs::write(&path, CONFIG_THAT_DOES_NOT_DESERIALIZE).unwrap();
+
+        let config = parse_config(COMMENTED_CONFIG);
+        write_config_to(&config, &path).unwrap();
+        let after_divert = fs::read(&path).unwrap();
+        assert_eq!(
+            fs::read(&backup).unwrap(),
+            CONFIG_THAT_DOES_NOT_DESERIALIZE.as_bytes()
+        );
+
+        // Same struct again — a `whisrs config` save, or a `set_hotkey` press.
+        write_config_to(&config, &path).unwrap();
+        assert_eq!(
+            fs::read(&backup).unwrap(),
+            CONFIG_THAT_DOES_NOT_DESERIALIZE.as_bytes(),
+            "the second write re-backed-up, clobbering the only copy of the user's original"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            after_divert,
+            "the second write did not take the merge path: the regenerated file is not stable"
+        );
+    }
+
+    /// A serde alias beside the canonical section: `[local]` is an alias for
+    /// `[local-whisper]`, so a file carrying both fails to deserialize with
+    /// `duplicate field` — a different failure class from the type error every
+    /// other non-deserializing fixture here uses, and the one that makes the
+    /// "merge with a smarter preserve set" design lose the whole config.
+    /// Preserving `[local]` alongside the `[local-whisper]` the writer emits
+    /// would produce a file the daemon cannot load at all. Divert instead.
+    const CONFIG_WITH_AN_ALIAS_SECTION_BESIDE_THE_CANONICAL_ONE: &str = r#"[general]
+backend = "local-whisper"
+
+[groq]
+api_key = "sk-my-real-secret-key"
+
+# Hand-written before the section was renamed, and kept afterwards.
+[local]
+model_path = "/home/u/.local/share/whisrs/models/ggml-base.en.bin"
+
+[local-whisper]
+model_path = "/home/u/.local/share/whisrs/models/ggml-small.en.bin"
+"#;
+
+    #[test]
+    fn an_alias_section_beside_the_canonical_one_is_backed_up_and_regenerated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, CONFIG_WITH_AN_ALIAS_SECTION_BESIDE_THE_CANONICAL_ONE).unwrap();
+        // The premise: this is a `duplicate field` failure, not a type error.
+        let err = toml::from_str::<Config>(CONFIG_WITH_AN_ALIAS_SECTION_BESIDE_THE_CANONICAL_ONE)
+            .expect_err("fixture must not deserialize")
+            .to_string();
+        assert!(err.contains("duplicate field `local-whisper`"), "{err}");
+
+        write_config_to(&parse_config(COMMENTED_CONFIG), &path).unwrap();
+
+        // The rewritten file loads. A merge that kept `[local]` would not: both
+        // spellings in one file is the `duplicate field` above, i.e. the daemon
+        // discarding the user's entire config.
+        let out = fs::read_to_string(&path).unwrap();
+        let reparsed: Config =
+            toml::from_str(&out).unwrap_or_else(|e| panic!("rewrite does not load: {e}\n{out}"));
+        assert_eq!(reparsed.general.backend, "groq");
+        assert!(!out.contains("[local]"), "{out}");
+
+        // And the original survives byte for byte, which is where the user's
+        // `api_key` and both `model_path`s are recoverable from.
+        assert_eq!(
+            fs::read(dir.path().join("config.toml.bak")).unwrap(),
+            CONFIG_WITH_AN_ALIAS_SECTION_BESIDE_THE_CANONICAL_ONE.as_bytes()
+        );
+    }
+
+    /// The write half of issue #134's read failure: `write_config_to` reads the
+    /// file before rewriting it, so a file it cannot read stops the write. It
+    /// must stop *without* side effects — no truncated config, and no `.bak`
+    /// holding whatever it managed to read (`run_setup` refuses before the wizard
+    /// for exactly this reason, so this path should now only be reachable by a
+    /// permission change mid-session).
+    #[test]
+    #[cfg(unix)]
+    fn write_config_to_an_unreadable_file_errors_and_touches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, COMMENTED_CONFIG).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        // Root ignores the mode bits, as in `unreadable_config_is_unusable_not_missing`.
+        if fs::read_to_string(&path).is_ok() {
+            return;
+        }
+
+        let err = write_config_to(&parse_config(COMMENTED_CONFIG), &path)
+            .expect_err("an unreadable config must not be silently overwritten");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains(&path.display().to_string()), "{rendered}");
+
+        // No backup: nothing was read, so there is nothing to have saved, and a
+        // partial one would look like a recovery point that is not.
+        assert!(
+            !dir.path().join("config.toml.bak").exists(),
+            "a failed read must not leave a .bak"
+        );
+        // And the file itself is exactly as it was.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), COMMENTED_CONFIG);
+    }
+
+    /// The `?` in `backup_and_regenerate` is the whole safety argument for the
+    /// divert: the broken file is the only copy of the user's hand-edits, so a
+    /// backup that cannot be written must abort the write rather than let
+    /// `atomic_write` replace the original anyway. Pinned here because that
+    /// property is now shared by two branches instead of one.
+    #[test]
+    fn a_divert_whose_backup_cannot_be_written_leaves_the_original_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, CONFIG_THAT_DOES_NOT_DESERIALIZE).unwrap();
+        // A directory where the `.bak` goes: `write_private_file` cannot open it.
+        fs::create_dir(dir.path().join("config.toml.bak")).unwrap();
+
+        let err = write_config_to(&parse_config(COMMENTED_CONFIG), &path)
+            .expect_err("a failed backup must abort the write");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("refusing to overwrite the only copy"),
+            "{rendered}"
+        );
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            CONFIG_THAT_DOES_NOT_DESERIALIZE,
+            "the only copy of the user's config must survive a failed backup"
+        );
     }
 
     #[test]
@@ -3492,7 +3944,9 @@ stray = "keep me"
         let dir = tempfile::tempdir().unwrap();
         let path = write_unknown_key_fixture(&dir);
 
-        let (config, unknown) = load_existing_config_from(&path).expect("fixture loads");
+        let ExistingConfig::Loaded { config, unknown } = load_existing_config_from(&path) else {
+            panic!("fixture loads");
+        };
         assert_eq!(config.general.backend, "groq");
         assert_eq!(
             unknown,
@@ -3505,7 +3959,168 @@ stray = "keep me"
             ]
         );
 
-        assert!(load_existing_config_from(&dir.path().join("absent.toml")).is_none());
+        // A path with nothing at it is `Missing`, and only that: the callers
+        // key their "start from defaults" behavior off this variant alone
+        // (issue #134).
+        assert!(matches!(
+            load_existing_config_from(&dir.path().join("absent.toml")),
+            ExistingConfig::Missing
+        ));
+    }
+
+    /// Issue #134: this file used to be indistinguishable from no file at all,
+    /// so `whisrs config` opened on defaults and saved over it.
+    #[test]
+    fn config_that_does_not_deserialize_is_unusable_not_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, CONFIG_THAT_DOES_NOT_DESERIALIZE).unwrap();
+
+        let ExistingConfig::Unusable { kind, message: msg } = load_existing_config_from(&path)
+        else {
+            panic!("valid TOML that does not deserialize must be reported as unusable");
+        };
+        // Read fine, wrong shape: regenerating over it works, so the flows may
+        // offer `whisrs setup`.
+        assert_eq!(kind, UnusableKind::Undeserializable);
+        // The path, so the user knows which file to open...
+        assert!(msg.contains(&path.display().to_string()), "{msg}");
+        // ...and the serde error verbatim, which is the only thing that names
+        // the offending key and value.
+        assert!(
+            msg.contains(r#"invalid type: string "2000", expected u64"#),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unreadable_config_is_unusable_not_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, COMMENTED_CONFIG).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        // Root ignores the mode bits and there is no portable way to make a
+        // file unreadable to root, so skip rather than assert something that
+        // only holds for an unprivileged user.
+        if fs::read_to_string(&path).is_ok() {
+            return;
+        }
+
+        let ExistingConfig::Unusable { kind, message: msg } = load_existing_config_from(&path)
+        else {
+            panic!("an unreadable file must not be reported as missing");
+        };
+        // And not as a shape problem either: this is the kind no rewrite can
+        // fix, so both flows must refuse rather than send the user to
+        // `whisrs setup` (issue #134).
+        assert_eq!(kind, UnusableKind::Unreadable);
+        assert!(msg.contains("cannot read config at"), "{msg}");
+        assert!(msg.contains(&path.display().to_string()), "{msg}");
+    }
+
+    /// A directory at the config path reads as `Unreadable` too, not as a
+    /// missing file: `read_to_string` fails with `IsADirectory`, and only
+    /// `NotFound` is `Missing`.
+    #[test]
+    fn a_directory_at_the_config_path_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::create_dir(&path).unwrap();
+
+        let ExistingConfig::Unusable { kind, message } = load_existing_config_from(&path) else {
+            panic!("a directory at the config path must not be reported as missing");
+        };
+        assert_eq!(kind, UnusableKind::Unreadable);
+        assert!(message.contains(&path.display().to_string()), "{message}");
+    }
+
+    /// These messages are the whole of what the user gets on this path, so pin
+    /// their contents: the reason first and verbatim, the path to edit, the
+    /// `.bak` the file lands in, and — for `whisrs config` — that nothing was
+    /// touched.
+    #[test]
+    fn undeserializable_config_messages_name_the_path_the_backup_and_the_way_out() {
+        let config_path = Path::new("/home/u/.config/whisrs/config.toml");
+        let reason = "cannot parse config at /home/u/.config/whisrs/config.toml: \
+                      invalid type: string \"2000\", expected u64";
+
+        let refusal = unusable_config_refusal(UnusableKind::Undeserializable, reason, config_path);
+        assert!(refusal.starts_with(reason), "{refusal}");
+        assert!(refusal.contains("Nothing was changed"), "{refusal}");
+        assert!(
+            refusal.contains("Fix /home/u/.config/whisrs/config.toml by hand"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("/home/u/.config/whisrs/config.toml.bak"),
+            "{refusal}"
+        );
+        // Regenerating over this file works, so the way out is offered.
+        assert!(refusal.contains("whisrs setup"), "{refusal}");
+
+        let warning = undeserializable_config_setup_warning(reason, config_path);
+        assert!(warning.starts_with(reason), "{warning}");
+        assert!(
+            warning.contains("/home/u/.config/whisrs/config.toml.bak"),
+            "{warning}"
+        );
+    }
+
+    /// The other kind (issue #134): a file whose bytes cannot be read is one
+    /// `write_config_to` cannot read either, so the one thing this message must
+    /// never do is send the user to `whisrs setup` — that path is guaranteed to
+    /// fail on the same read, after the whole wizard. It has to name the likely
+    /// cause and the hand fix instead.
+    #[test]
+    fn the_unreadable_refusal_names_the_hand_fix_and_never_whisrs_setup() {
+        let config_path = Path::new("/home/u/.config/whisrs/config.toml");
+        let reason = "cannot read config at /home/u/.config/whisrs/config.toml: \
+                      Permission denied (os error 13)";
+
+        let refusal = unreadable_config_refusal(reason, config_path);
+        assert!(refusal.starts_with(reason), "{refusal}");
+        assert!(refusal.contains("Nothing was changed"), "{refusal}");
+        assert!(
+            refusal.contains("rewriting the file cannot help"),
+            "{refusal}"
+        );
+        // The cause and the remedy, concretely.
+        assert!(refusal.contains("ownership or permissions"), "{refusal}");
+        assert!(
+            refusal.contains("chown $USER /home/u/.config/whisrs/config.toml"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("chmod 600 /home/u/.config/whisrs/config.toml"),
+            "{refusal}"
+        );
+        // And never the way out that cannot work. The text does name `whisrs
+        // setup`, to say why it cannot help, so the absence of one phrasing
+        // proves nothing — "try `whisrs setup` instead" would slip past it.
+        // Assert the explanation is present instead: every sentence mentioning
+        // the command has to be the one ruling it out.
+        assert!(
+            refusal.contains("`whisrs setup` writes the config by reading it first"),
+            "the refusal must say why `whisrs setup` cannot help: {refusal}"
+        );
+        assert_eq!(
+            refusal.matches("whisrs setup").count(),
+            2,
+            "every mention of `whisrs setup` must be part of ruling it out; a new one \
+             is a way out that fails on the same read: {refusal}"
+        );
+        assert!(
+            !refusal.contains(".bak"),
+            "nothing gets backed up on this path, so promising a .bak is a lie: {refusal}"
+        );
+
+        // `whisrs config` refuses with exactly this text, so the two cannot
+        // drift apart.
+        assert_eq!(
+            unusable_config_refusal(UnusableKind::Unreadable, reason, config_path),
+            refusal
+        );
     }
 
     /// The text of the function `source` declares at `header`, up to the next
@@ -3536,6 +4151,105 @@ stray = "keep me"
         assert!(
             warn_at < prompt_at,
             "the warning must be printed before the use-existing prompt"
+        );
+    }
+
+    /// The three `run_setup` arms, sliced out of the source in the order they
+    /// appear. The match is the whole of the issue #134 fix on this side and is
+    /// pure dialoguer IO below it, so its control flow is only checkable as text.
+    ///
+    /// Comments are stripped first ([`source_without_comments`]): these arms
+    /// carry long explanations, and a future one containing the word "return"
+    /// would otherwise fail the assertion that an arm does not return.
+    fn run_setup_unusable_arms() -> (String, String, usize, usize) {
+        let body = function_body(include_str!("setup.rs"), "pub fn run_setup(");
+        let unreadable_at = body
+            .find("kind: UnusableKind::Unreadable,")
+            .expect("run_setup does not handle an unreadable config");
+        let undeserializable_at = body
+            .find("kind: UnusableKind::Undeserializable,")
+            .expect("run_setup does not handle an undeserializable config");
+        let missing_at = body
+            .find("ExistingConfig::Missing =>")
+            .expect("run_setup does not handle a missing config");
+        assert!(
+            unreadable_at < undeserializable_at && undeserializable_at < missing_at,
+            "this test slices the arms in source order: unreadable, undeserializable, missing"
+        );
+        (
+            source_without_comments(&body[unreadable_at..undeserializable_at]),
+            source_without_comments(&body[undeserializable_at..missing_at]),
+            unreadable_at,
+            undeserializable_at,
+        )
+    }
+
+    /// Same technique for the issue #134 arm: `run_setup` must say that the file
+    /// it found does not load *before* the wizard starts asking questions (it
+    /// used to say nothing at all), and must then carry on — refusing would leave
+    /// the user with no way to produce a config.
+    #[test]
+    fn run_setup_warns_about_an_undeserializable_config_then_continues() {
+        let body = function_body(include_str!("setup.rs"), "pub fn run_setup(");
+        let (_, arm, _, undeserializable_at) = run_setup_unusable_arms();
+
+        assert!(
+            arm.contains("undeserializable_config_setup_warning"),
+            "run_setup must tell the user why the existing config cannot be used: {arm}"
+        );
+        // Falls through into the wizard: no early exit of any spelling, and no
+        // substituting defaults for the file it could not read.
+        for refusal in ["return", "bail!", "?;"] {
+            assert!(
+                !arm.contains(refusal),
+                "setup must fall through into the wizard, not refuse (`{refusal}`): {arm}"
+            );
+        }
+        assert!(
+            !arm.contains("default_config()"),
+            "setup builds its config from the wizard, not from defaults: {arm}"
+        );
+        // Before the first wizard question, so the warning is not buried under
+        // the prompts it explains.
+        let wizard_at = body
+            .find("select_backend(None)")
+            .expect("run_setup runs the backend wizard");
+        assert!(
+            undeserializable_at < wizard_at,
+            "the warning must be printed before the wizard prompts"
+        );
+    }
+
+    /// The other half of issue #134, and the one that cost the user a whole
+    /// wizard: a config whose bytes cannot be read is a refusal, and it has to
+    /// happen before the first question. Warning and continuing ran the entire
+    /// wizard and then died in `write_config_to`'s own read, writing nothing and
+    /// backing nothing up.
+    #[test]
+    fn run_setup_refuses_an_unreadable_config_before_the_first_question() {
+        let body = function_body(include_str!("setup.rs"), "pub fn run_setup(");
+        let (arm, _, unreadable_at, _) = run_setup_unusable_arms();
+
+        assert!(
+            arm.contains("bail!"),
+            "an unreadable config must abort setup, not warn: {arm}"
+        );
+        assert!(
+            arm.contains("unreadable_config_refusal"),
+            "the refusal must carry the ownership/permissions guidance: {arm}"
+        );
+        // Not the message that promises a backup which cannot be written.
+        assert!(
+            !arm.contains("undeserializable_config_setup_warning"),
+            "the unreadable arm must not promise a .bak: {arm}"
+        );
+        // Before the first question, so nothing the user types is thrown away.
+        let wizard_at = body
+            .find("select_backend(None)")
+            .expect("run_setup runs the backend wizard");
+        assert!(
+            unreadable_at < wizard_at,
+            "the refusal must come before the wizard prompts"
         );
     }
 }

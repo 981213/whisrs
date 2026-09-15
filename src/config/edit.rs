@@ -28,13 +28,32 @@ pub fn run_config_menu() -> Result<()> {
     println!("\n{BOLD}whisrs config{RESET} — edit ~/.config/whisrs/config.toml\n");
 
     let (mut config, fresh) = match setup::load_existing_config() {
-        Some((cfg, unknown)) => {
+        setup::ExistingConfig::Loaded { config, unknown } => {
             // Warn at load, not at save: the keys are about to be shown back to
             // the user as a config that looks fine (issue #116).
             setup::print_unknown_keys_warning(&unknown);
-            (cfg, false)
+            (config, false)
         }
-        None => {
+        // A file we cannot use is not a missing file (issue #134). Opening the
+        // menu on defaults here and saving would rewrite the user's file from
+        // those defaults, deleting every section the defaults leave unset —
+        // API keys included. Refuse instead, and leave the file alone.
+        //
+        // Both kinds refuse; only the way out differs, which is
+        // `unusable_config_refusal`'s job (a file we cannot read is one
+        // `whisrs setup` cannot rewrite either).
+        //
+        // Returned as an error rather than printed: `src/cli/main.rs` renders
+        // it as `config failed: {e:#}` and exits non-zero, so printing it here
+        // too would show the same serde error twice.
+        setup::ExistingConfig::Unusable { kind, message } => {
+            anyhow::bail!(setup::unusable_config_refusal(
+                kind,
+                &message,
+                &crate::config_path()
+            ));
+        }
+        setup::ExistingConfig::Missing => {
             println!(
                 "  {YELLOW}No config file found — starting from defaults.{RESET} \
                  Run {BOLD}whisrs setup{RESET} for the full onboarding flow."
@@ -1203,6 +1222,55 @@ mod tests {
         assert!(
             warn_at < prompt_at,
             "the warning must be printed before the menu"
+        );
+    }
+
+    /// Issue #134: a config that cannot be read is not a config that isn't
+    /// there. Opening the menu on `default_config()` and saving rewrote the
+    /// user's file from defaults, deleting every section they leave unset — API
+    /// keys included. Pinned the same way, since the refusal is in interactive IO.
+    #[test]
+    fn run_config_menu_refuses_an_unusable_config_before_the_menu() {
+        let source = include_str!("edit.rs");
+        let body = source
+            .split("pub fn run_config_menu(")
+            .nth(1)
+            .expect("edit.rs defines run_config_menu")
+            .split("\n}\n")
+            .next()
+            .expect("run_config_menu has a body");
+
+        let arm_at = body
+            .find("setup::ExistingConfig::Unusable {")
+            .expect("run_config_menu does not handle an unusable config");
+        let missing_at = body
+            .find("setup::ExistingConfig::Missing =>")
+            .expect("run_config_menu does not handle a missing config");
+        assert!(
+            arm_at < missing_at,
+            "this test slices the unusable arm as the text before the missing arm"
+        );
+        // Comments stripped: the arm explains itself at length, and the
+        // assertions below search for code spellings a comment could also
+        // contain (`default_config()`).
+        let arm = setup::source_without_comments(&body[arm_at..missing_at]);
+
+        // It refuses...
+        assert!(
+            arm.contains("anyhow::bail!"),
+            "the unusable branch must return an error so the process exits non-zero: {arm}"
+        );
+        // ...and does not quietly substitute defaults, which is the bug.
+        assert!(
+            !arm.contains("default_config()"),
+            "the unusable branch must not fall back to defaults: {arm}"
+        );
+        // And it refuses before the menu opens, so no edit can be made against
+        // a config the user never had.
+        let prompt_at = body.find("Select::new()").expect("run_config_menu prompts");
+        assert!(
+            arm_at < prompt_at,
+            "the refusal must come before the menu is shown"
         );
     }
 
