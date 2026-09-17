@@ -449,12 +449,14 @@ pub(crate) fn select_injector_backend(existing: Option<&Config>) -> Result<Injec
         InjectorBackend::Auto,
         InjectorBackend::Uinput,
         InjectorBackend::WaylandVk,
+        InjectorBackend::Fcitx5,
     ];
     let default_idx = existing
         .map(|cfg| match cfg.input.backend {
             InjectorBackend::Auto => 0,
             InjectorBackend::Uinput => 1,
             InjectorBackend::WaylandVk => 2,
+            InjectorBackend::Fcitx5 => 3,
         })
         .unwrap_or(0);
 
@@ -465,6 +467,7 @@ pub(crate) fn select_injector_backend(existing: Option<&Config>) -> Result<Injec
             "Auto        (recommended — Wayland virtual keyboard, falls back to uinput)",
             "uinput      (evdev/uinput; layout-dependent on Wayland)",
             "wayland-vk  (force zwp_virtual_keyboard_v1 — fixes bilingual typing on Wayland)",
+            "fcitx5      (direct text via fcitx5-text-bridge — no clipboard or text key events)",
         ])
         .default(default_idx)
         .interact()

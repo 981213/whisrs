@@ -302,6 +302,10 @@ pub enum InjectorBackend {
     Uinput,
     /// Force `zwp_virtual_keyboard_v1` (errors at startup if unsupported).
     WaylandVk,
+    /// Commit UTF-8 through the `fcitx5-text-bridge` addon. Text bypasses
+    /// simulated key events and the clipboard. Hyprland users with Fcitx can
+    /// use this to prevent dictated text from starting IME composition.
+    Fcitx5,
 }
 
 /// Keyboard injection (uinput) tuning.
@@ -3009,6 +3013,7 @@ mod tests {
             (InjectorBackend::Auto, "auto"),
             (InjectorBackend::Uinput, "uinput"),
             (InjectorBackend::WaylandVk, "wayland-vk"),
+            (InjectorBackend::Fcitx5, "fcitx5"),
         ] {
             #[derive(Serialize, Deserialize)]
             struct Wrap {

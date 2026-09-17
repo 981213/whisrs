@@ -91,6 +91,12 @@ height = 40                 # 36..=48 (clamped)
 device = "default"
 
 [input]
+# Injection backend: auto | uinput | wayland-vk | fcitx5. Default: auto.
+# `fcitx5` commits Unicode text directly through the independently installed
+# fcitx5-text-bridge addon. It does not use the clipboard or synthesize text
+# key events, so it avoids triggering Fcitx composition on Hyprland. Keep
+# `paste = false` when using it.
+backend = "auto"
 # Inter-key delay for the virtual keyboard (uinput). Raise this if a TUI
 # drops characters while whisrs is typing — e.g. Node/Ink-based apps like
 # Claude Code in raw mode. Default: 2.

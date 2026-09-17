@@ -1,3 +1,5 @@
+use std::os::unix::net::UnixDatagram;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -8,6 +10,114 @@ use whisrs::InjectorBackend;
 use xkb_type::ClipboardBackend;
 
 static KEYBOARD: OnceLock<StdMutex<Option<Box<dyn xkb_type::KeyInjector>>>> = OnceLock::new();
+
+const FCITX5_BRIDGE_SOCKET: &str = "fcitx5-text-bridge.sock";
+const FCITX5_BRIDGE_VERSION: u8 = 1;
+const FCITX5_COMMIT_TEXT: u8 = 1;
+const FCITX5_DELETE_BEFORE_CURSOR: u8 = 2;
+const FCITX5_MAX_TEXT_BYTES: usize = 60 * 1024;
+
+/// Direct-text injector backed by the external `fcitx5-text-bridge` addon.
+struct Fcitx5Injector {
+    socket: UnixDatagram,
+    combo_keyboard: Option<xkb_type::wayland_vk::WaylandVkKeyboard>,
+    key_delay: std::time::Duration,
+}
+
+impl Fcitx5Injector {
+    fn new(key_delay: std::time::Duration) -> Result<Self> {
+        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|value| !value.is_empty())
+            .context("XDG_RUNTIME_DIR is not set")?;
+        let socket_path = PathBuf::from(runtime_dir).join(FCITX5_BRIDGE_SOCKET);
+        if !socket_path.exists() {
+            anyhow::bail!(
+                "Fcitx text bridge socket is missing: {}\n\
+                 Install and enable fcitx5-text-bridge, then restart Fcitx",
+                socket_path.display()
+            );
+        }
+
+        let socket = UnixDatagram::unbound().context("failed to create Fcitx bridge socket")?;
+        socket
+            .connect(&socket_path)
+            .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
+        Ok(Self {
+            socket,
+            combo_keyboard: None,
+            key_delay,
+        })
+    }
+
+    fn send_packet(&self, operation: u8, payload: &[u8]) -> Result<()> {
+        let mut packet = Vec::with_capacity(payload.len() + 2);
+        packet.extend_from_slice(&[FCITX5_BRIDGE_VERSION, operation]);
+        packet.extend_from_slice(payload);
+        let sent = self
+            .socket
+            .send(&packet)
+            .context("failed to send request to fcitx5-text-bridge")?;
+        if sent != packet.len() {
+            anyhow::bail!("short send to fcitx5-text-bridge: {sent}/{}", packet.len());
+        }
+        Ok(())
+    }
+
+    fn text_chunks(text: &str) -> impl Iterator<Item = &str> {
+        let mut remaining = text;
+        std::iter::from_fn(move || {
+            if remaining.is_empty() {
+                return None;
+            }
+            let mut end = remaining.len().min(FCITX5_MAX_TEXT_BYTES);
+            while !remaining.is_char_boundary(end) {
+                end -= 1;
+            }
+            let (chunk, rest) = remaining.split_at(end);
+            remaining = rest;
+            Some(chunk)
+        })
+    }
+
+    fn combo_keyboard(&mut self) -> Result<&mut xkb_type::wayland_vk::WaylandVkKeyboard> {
+        if self.combo_keyboard.is_none() {
+            self.combo_keyboard = Some(xkb_type::wayland_vk::WaylandVkKeyboard::new(
+                self.key_delay,
+            )?);
+        }
+        Ok(self.combo_keyboard.as_mut().expect("initialized above"))
+    }
+}
+
+impl xkb_type::KeyInjector for Fcitx5Injector {
+    fn type_text(&mut self, text: &str) -> Result<()> {
+        for chunk in Self::text_chunks(text) {
+            self.send_packet(FCITX5_COMMIT_TEXT, chunk.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn backspace(&mut self, count: usize) -> Result<()> {
+        let mut remaining = count;
+        while remaining > 0 {
+            let part = remaining.min(u32::MAX as usize) as u32;
+            self.send_packet(FCITX5_DELETE_BEFORE_CURSOR, &part.to_le_bytes())?;
+            remaining -= part as usize;
+        }
+        Ok(())
+    }
+
+    fn send_combo(&mut self, keys: &[xkb_type::evdev::Key]) -> Result<()> {
+        self.combo_keyboard()?.send_combo(keys)
+    }
+
+    fn set_key_delay(&mut self, delay: std::time::Duration) {
+        self.key_delay = delay;
+        if let Some(keyboard) = self.combo_keyboard.as_mut() {
+            keyboard.set_key_delay(delay);
+        }
+    }
+}
 
 /// Delay before the post-paste clipboard restore: long enough for the paste
 /// keystroke to land in the target app, short enough that the user's
@@ -449,6 +559,11 @@ fn new_keyboard(
             info!("using wayland virtual-keyboard injection backend");
             Ok(Box::new(kb))
         }
+        InjectorBackend::Fcitx5 => {
+            let injector = Fcitx5Injector::new(key_delay)?;
+            info!("using Fcitx direct-text injection backend");
+            Ok(Box::new(injector))
+        }
         InjectorBackend::Auto => {
             if std::env::var_os("WAYLAND_DISPLAY").is_some() {
                 match xkb_type::wayland_vk::WaylandVkKeyboard::new(key_delay) {
@@ -646,6 +761,27 @@ pub(crate) fn is_terminal_class(class: &str, user_classes: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fcitx_text_chunks_skip_empty_input() {
+        assert_eq!(Fcitx5Injector::text_chunks("").count(), 0);
+    }
+
+    #[test]
+    fn fcitx_text_chunks_preserve_utf8_at_packet_boundary() {
+        let text = format!(
+            "{}中{}",
+            "a".repeat(FCITX5_MAX_TEXT_BYTES - 1),
+            "b".repeat(17)
+        );
+        let chunks: Vec<_> = Fcitx5Injector::text_chunks(&text).collect();
+
+        assert_eq!(chunks.concat(), text);
+        assert!(chunks.len() >= 2);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.len() <= FCITX5_MAX_TEXT_BYTES));
+    }
 
     /// `[input] terminal_classes` as the daemon hands it over.
     fn user(classes: &[&str]) -> Vec<String> {
